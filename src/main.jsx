@@ -21,7 +21,7 @@ function App() {
   return (
     <>
       <div style={{
-        display: "flex", gap: 0,
+        display: "flex", flexWrap: "wrap", gap: 0,
         fontFamily: "'JetBrains Mono', ui-monospace, monospace",
         fontSize: 11, borderBottom: "1px solid #1b2638",
         background: "#05070d",
