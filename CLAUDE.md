@@ -27,6 +27,7 @@ src/
   GuardianLens.jsx    Tool: "GuardianLens" — bounded multi-agent rigor instrument
   GroundwaterLevels.jsx  Tool: USGS NWIS Ohio groundwater-level viewer
   CrystalComposer.jsx    Tool: "Crystal Composer" — local ballast/Helios/Guardian agent composer
+  HunterMode.jsx         Tool: "Hunter Mode" — sweep-radar anomaly watch over simulated channels
 portability_layer.py  Standalone Python skeleton — "canon meeting" form-checker
 tidal_lines.py        Standalone Python script — tidal-signal discriminator (has a synthetic self-test)
 guardian_hq_topology.html  Standalone static HTML report (network topology record)
@@ -60,6 +61,7 @@ const TOOLS = [
   { id: "guardian", label: "GuardianLens", component: GuardianLens },
   { id: "groundwater", label: "Groundwater Levels", component: GroundwaterLevels },
   { id: "crystal", label: "Crystal Composer", component: CrystalComposer },
+  { id: "hunter", label: "Hunter Mode", component: HunterMode },
 ];
 ```
 Each tool is a single self-contained default-exported component in `src/`.
@@ -141,6 +143,18 @@ dispersed field against ballast, reporting STABLE or DRIFT). "Deploy" writes an
 in-page compiled record only — nothing is sent anywhere, and any change to the
 facet set invalidates it. Keep it network-free and keep the gating semantics if
 you extend it.
+
+### HunterMode (no LLM, no network)
+
+A local sweep-radar watch over four synthesized signal channels, in a green CRT
+palette. Each tick (200ms) every channel takes a raw sample, a `BUFFER_LIMIT`
+moving average filters it, and a channel reads ANOMALY when the filtered value
+is more than `THRESHOLD` from `BASELINE`. Background noise is bounded so it can
+never trip the detector on its own; contacts come only from injected
+disturbances (`DISTURB_*`). A contact spawns on a channel's clear → anomaly
+edge, and the operator walks it DETECTED → ACQUIRED → NEUTRALIZED. Sampling
+happens outside state updaters so StrictMode's double-invoked updaters stay
+pure — keep it that way if you touch the tick loop.
 
 ## Standalone Python scripts
 
