@@ -5,9 +5,9 @@ import { useState, useEffect, useRef } from "react";
 // sample is smoothed by a moving average; when the filtered value strays past
 // THRESHOLD from BASELINE the channel reads ANOMALY and a contact is placed on
 // the scope. The operator walks each contact DETECTED → ACQUIRED → NEUTRALIZED.
-// Nothing here calls a model or fetches data; the signals are synthesized
-// locally. The only request is the Google Fonts stylesheet every tool imports,
-// and Courier New stands in when it can't load.
+// The signals are synthesized locally. Sol, the prompt under the top bar, is
+// Claude: it reads the Guardian daemon's /status (through Vite's /daemon proxy)
+// plus this console's state, and answers the operator. Sol only reads.
 
 const MONO = "'JetBrains Mono', 'Courier New', ui-monospace, monospace";
 
@@ -34,7 +34,55 @@ const CHANNELS = [
   { id: "CH-D", freq: 2100, label: "DELTA" },
 ];
 
+// ── Sol ──────────────────────────────────────────────────────────────────────
+// The Guardian daemon (guardian/, port 8547) serves GET /status without CORS
+// headers, so the browser reaches it same-origin through vite.config.js's
+// /daemon proxy. Sol is Claude, called directly from the browser like the
+// turret; its key stays in this browser.
+const DAEMON_STATUS_URL = "/daemon/status";
+const DAEMON_POLL_MS = 10000;
+const DAEMON_OFFLINE_POLL_MS = 60000; // back off: each failed poll also logs a proxy error in the dev server
+const DAEMON_TIMEOUT_MS = 2500;
+
+const SOL_MODEL = "claude-opus-5-5";
+
+const SOL_SYSTEM = `You are Sol, the voice of a Guardian "Hunter Mode" console. The operator speaks to you; you answer about the Guardian daemon and the console. Return ONLY a JSON object — no prose, no markdown, no backticks.
+
+GROUND RULES:
+- Facts about the daemon come ONLY from the DAEMON STATUS JSON in the message. Never invent fields, values, history or causes it does not show. If DAEMON STATUS is "unreachable", say the daemon cannot be reached and do not describe its state.
+- The console's channels and contacts are SIMULATED signals synthesized in the browser, not sensor data. Never present them as real detections; say they are simulated when it matters to the answer.
+- You can read the daemon and the console but cannot change either. Never claim to have acted.
+- reply <= 60 words, plain and direct.
+- grounding: integer 0-3 = how much of the reply rests on the provided status and console data (0 none — general talk, or the daemon is unreachable and the answer needed it; 3 read entirely from the data).
+
+Return EXACTLY:
+{"reply":"...","grounding":N}`;
+
+const SOL_SCHEMA = {
+  type: "object",
+  properties: {
+    reply: { type: "string" },
+    grounding: { type: "integer", enum: [0, 1, 2, 3] },
+  },
+  required: ["reply", "grounding"],
+  additionalProperties: false,
+};
+
 const randIn = ([lo, hi]) => lo + Math.random() * (hi - lo);
+
+// GET the daemon's status JSON, or null when it can't be reached in time.
+async function readDaemon() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), DAEMON_TIMEOUT_MS);
+  try {
+    const r = await fetch(DAEMON_STATUS_URL, { signal: ctrl.signal, cache: "no-store" });
+    return r.ok ? await r.json() : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // Trim the log to `max` by dropping the oldest neutralized contacts. Unresolved
 // contacts are never evicted, so the operator can always still act on them.
@@ -164,6 +212,178 @@ const MiniWave = ({ history, anomaly }) => {
   );
 };
 
+function useDaemon() {
+  const [status, setStatus] = useState(undefined); // undefined: not checked yet; null: unreachable
+  useEffect(() => {
+    let live = true, timer;
+    const poll = async () => {
+      const s = await readDaemon();
+      if (!live) return;
+      setStatus(s);
+      timer = setTimeout(poll, s ? DAEMON_POLL_MS : DAEMON_OFFLINE_POLL_MS);
+    };
+    poll();
+    return () => { live = false; clearTimeout(timer); };
+  }, []);
+  return [status, setStatus];
+}
+
+function consoleSnapshot(channels, targets) {
+  const ch = channels.map(c =>
+    `${c.label} ${c.status} filtered=${c.filtered.toFixed(3)} delta=${(c.filtered - BASELINE).toFixed(3)}`);
+  const open = targets.filter(t => t.status !== "neutralized").map(t =>
+    `${t.label} ${t.status} delta=${t.delta} hits=${t.hits} since ${t.ts} UTC`);
+  return `channels (simulated):\n${ch.join("\n")}\nopen contacts:\n${open.length ? open.join("\n") : "none"}`;
+}
+
+const SolBar = ({ channels, targets, narrow }) => {
+  const [apiKey, setApiKey] = useState(import.meta.env.VITE_ANTHROPIC_API_KEY || "");
+  const [daemon, setDaemon] = useDaemon();
+  const [input, setInput] = useState("");
+  const [result, setResult] = useState(null);
+  const [raw, setRaw] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+
+  const speak = async () => {
+    const q = input.trim();
+    if (!q || loading) return;
+    if (!apiKey.trim()) { setErr("Enter an Anthropic API key first."); return; }
+    setLoading(true); setErr(""); setResult(null); setRaw("");
+    try {
+      const status = await readDaemon();
+      setDaemon(status);
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey.trim(),
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+          "anthropic-beta": "server-side-fallback-2026-07-01",
+        },
+        body: JSON.stringify({
+          model: SOL_MODEL,
+          max_tokens: 16000,
+          system: SOL_SYSTEM,
+          output_config: { effort: "low", format: { type: "json_schema", schema: SOL_SCHEMA } },
+          fallbacks: "default",
+          messages: [{
+            role: "user",
+            content: `DAEMON STATUS:\n${status ? JSON.stringify(status) : "unreachable"}\n\nCONSOLE:\n${consoleSnapshot(channels, targets)}\n\nOPERATOR:\n${q}`,
+          }],
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        setErr(`API error ${resp.status}: ${data?.error?.message || JSON.stringify(data)}`);
+        return;
+      }
+      if (data.stop_reason === "refusal") {
+        setErr(`Sol declined to answer${data.stop_details?.category ? ` (${data.stop_details.category})` : ""}.`);
+        return;
+      }
+      const text = (data.content || [])
+        .filter(b => b.type === "text")
+        .map(b => b.text)
+        .join("\n").trim();
+      setRaw(text);
+      const a = text.indexOf("{"), z = text.lastIndexOf("}");
+      if (a !== -1 && z !== -1) setResult(JSON.parse(text.slice(a, z + 1)));
+      else setErr("Could not parse Sol's reply — showing raw output below.");
+    } catch (e) {
+      setErr("Sol failed: " + (e?.message || "unknown error"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const checking = daemon === undefined;
+  const pill = checking ? "○ DAEMON …"
+    : daemon ? `● DAEMON · ${String(daemon.mode ?? "?").toUpperCase()} · CYCLE ${daemon.cycle ?? "?"}`
+    : "○ DAEMON OFFLINE";
+  const pillColor = checking ? "rgba(126,200,135,0.5)" : daemon ? "#7EC887" : "#FF6440";
+  const grounding = result?.grounding ?? 0;
+  const groundColor = grounding >= 3 ? "100,200,140" : grounding >= 1 ? "255,200,60" : "255,100,60";
+  const field = {
+    background: "rgba(100,200,140,0.03)", border: "1px solid rgba(100,200,140,0.15)",
+    color: "#7EC887", fontFamily: "inherit", fontSize: 11, padding: "6px 10px", outline: "none",
+  };
+
+  return (
+    <div style={{
+      padding: narrow ? "10px 16px" : "10px 24px",
+      borderBottom: "1px solid rgba(100,200,140,0.12)",
+      display: "flex", flexDirection: "column", gap: 8,
+      flexShrink: 0,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 9, letterSpacing: "0.4em", color: "rgba(255,200,60,0.85)" }}>SOL ›</span>
+        {!import.meta.env.VITE_ANTHROPIC_API_KEY && (
+          <input
+            className="hm-input"
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder="sk-ant-… key · stays in-browser"
+            style={{ ...field, width: narrow ? "100%" : 170, boxSizing: "border-box" }}
+          />
+        )}
+        <input
+          className="hm-input"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") speak(); }}
+          placeholder="speak to sol — ask about the daemon or the scope"
+          style={{ ...field, flex: "1 1 220px", minWidth: 0 }}
+        />
+        <button onClick={speak} disabled={loading} style={{
+          padding: "6px 14px", fontSize: 8, letterSpacing: "0.25em",
+          background: "transparent", border: "1px solid rgba(255,200,60,0.4)",
+          color: "rgba(255,200,60,0.85)", cursor: loading ? "wait" : "pointer",
+          fontFamily: "inherit", opacity: loading ? 0.5 : 1,
+        }}>{loading ? "READING…" : "SPEAK"}</button>
+        <span style={{ fontSize: 8, letterSpacing: "0.25em", color: pillColor, opacity: 0.75, whiteSpace: "nowrap" }}>
+          {pill}
+        </span>
+      </div>
+
+      {loading && (
+        <div style={{ fontSize: 9, letterSpacing: "0.2em", color: "rgba(255,200,60,0.5)" }}>
+          ◌ sol is reading the daemon…
+        </div>
+      )}
+      {result && (
+        <div style={{ display: "flex", gap: 14, alignItems: "flex-start", userSelect: "text" }}>
+          <div style={{ flex: 1, fontSize: 11, lineHeight: 1.6, color: "rgba(255,220,150,0.92)" }}>
+            {result.reply}
+          </div>
+          <div style={{ flexShrink: 0, textAlign: "right" }}>
+            <div style={{ fontSize: 7, letterSpacing: "0.2em", opacity: 0.3, marginBottom: 4 }}>GROUNDING</div>
+            <div style={{ display: "flex", gap: 2, justifyContent: "flex-end" }}>
+              {[1, 2, 3].map(n => (
+                <div key={n} style={{
+                  width: 10, height: 4,
+                  background: `rgba(${groundColor},${n <= grounding ? 0.85 : 0.12})`,
+                }} />
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      {err && (
+        <div style={{ fontSize: 10, color: "rgba(255,100,60,0.9)", userSelect: "text" }}>{err}</div>
+      )}
+      {!result && raw && (
+        <pre style={{
+          margin: 0, fontSize: 10, whiteSpace: "pre-wrap", color: "rgba(126,200,135,0.6)",
+          fontFamily: "inherit", userSelect: "text",
+        }}>{raw}</pre>
+      )}
+    </div>
+  );
+};
+
 export default function HunterMode() {
   const { channels, targets, radarAngle, acquire, neutralize } = useHunter();
   const narrow = useNarrow(STACK_BELOW);
@@ -190,6 +410,7 @@ export default function HunterMode() {
     }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+        input.hm-input::placeholder{color:rgba(126,200,135,0.3)}
       `}</style>
 
       {/* CRT scanlines */}
@@ -217,6 +438,8 @@ export default function HunterMode() {
           <span>{new Date().toISOString().slice(11, 19)} UTC</span>
         </div>
       </div>
+
+      <SolBar channels={channels} targets={targets} narrow={narrow} />
 
       <div style={{
         display: "flex", flex: 1,

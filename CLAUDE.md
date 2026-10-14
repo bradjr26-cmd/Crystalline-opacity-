@@ -19,7 +19,7 @@ the repo — there isn't one.
 
 ```
 index.html            Vite entry HTML for the React app
-vite.config.js        Vite config (React plugin only)
+vite.config.js        Vite config (React plugin + /daemon proxy to the Guardian daemon)
 package.json          "live-lens-turret" — the only buildable project here
 src/
   main.jsx            App shell + tab switcher (the TOOLS registry)
@@ -27,12 +27,12 @@ src/
   GuardianLens.jsx    Tool: "GuardianLens" — bounded multi-agent rigor instrument
   GroundwaterLevels.jsx  Tool: USGS NWIS Ohio groundwater-level viewer
   CrystalComposer.jsx    Tool: "Crystal Composer" — local ballast/Helios/Guardian agent composer
-  HunterMode.jsx         Tool: "Hunter Mode" — sweep-radar anomaly watch over simulated channels
+  HunterMode.jsx         Tool: "Hunter Mode" — sweep-radar anomaly watch + Sol (Claude reading the Guardian daemon)
 portability_layer.py  Standalone Python skeleton — "canon meeting" form-checker
 tidal_lines.py        Standalone Python script — tidal-signal discriminator (has a synthetic self-test)
 guardian_hq_topology.html  Standalone static HTML report (network topology record)
 CRYSTLLINEUITests.swift   Orphaned Xcode UI-test stub — no surrounding Xcode project in this repo
-.env.example          Template for VITE_ANTHROPIC_API_KEY
+.env.example          Template for VITE_ANTHROPIC_API_KEY (and optional GUARDIAN_URL)
 ```
 
 ## The React app (live-lens-turret)
@@ -88,9 +88,9 @@ each owns its full visual design independently.
   and often `raw` (the unparsed model text, shown as a fallback `<pre>` block
   when JSON parsing fails). Keep this shape when adding similar features.
 
-### Anthropic API integration (LiveTurret, GuardianLens)
+### Anthropic API integration (LiveTurret, GuardianLens, HunterMode's Sol)
 
-These two tools call the Anthropic Messages API **directly from the browser**:
+These tools call the Anthropic Messages API **directly from the browser**:
 ```js
 fetch("https://api.anthropic.com/v1/messages", {
   headers: {
@@ -124,6 +124,14 @@ Conventions to preserve when touching this code:
   mechanisms — preserve the scoring semantics if you modify a prompt; don't
   loosen the "don't invent authority" language.
 
+HunterMode's Sol uses the same browser `fetch` and key handling, with a newer
+request shape: `claude-opus-5-5` at `output_config.effort: "low"`, the reply
+constrained by `output_config.format` (a JSON schema matching its `SOL_SYSTEM`
+contract), and `fallbacks: "default"` under the
+`anthropic-beta: server-side-fallback-2026-07-01` header so a declined request
+is retried server-side. It checks `stop_reason === "refusal"` before reading
+`content`. It keeps the first-`{`/last-`}` parse and raw `<pre>` fallback.
+
 ### GroundwaterLevels (no LLM)
 
 Pure data-fetch/display tool: pulls from the public USGS NWIS API
@@ -144,7 +152,7 @@ in-page compiled record only — nothing is sent anywhere, and any change to the
 facet set invalidates it. Keep it network-free and keep the gating semantics if
 you extend it.
 
-### HunterMode (no LLM, no network)
+### HunterMode (Sol: Claude + the Guardian daemon)
 
 A local sweep-radar watch over four synthesized signal channels, in a green CRT
 palette. Each tick (200ms) every channel takes a raw sample, a `BUFFER_LIMIT`
@@ -158,8 +166,19 @@ has at most one open contact: re-tripping while it's open bumps its hit count
 neutralized contacts, so an open one never disappears. Below `STACK_BELOW` px
 the three panels stack vertically. Sampling happens outside state updaters so
 StrictMode's double-invoked updaters stay pure — keep it that way if you touch
-the tick loop. Its only network request is the shared Google Fonts `@import`
-(Courier New is the fallback).
+the tick loop.
+
+**Sol** is the prompt bar under the top bar: the operator speaks, and Sol
+(Claude) answers from the Guardian daemon's `GET /status` plus a snapshot of
+the console (channels, open contacts). Sol only reads — the daemon stays
+read-only and Sol's prompt forbids claiming to have acted, inventing daemon
+facts, or treating the simulated channels as real detections; its `grounding`
+self-score (0–3) drives the meter beside each reply. The daemon sends no CORS
+headers, so the browser reaches it same-origin through the `/daemon` proxy in
+`vite.config.js` (target `GUARDIAN_URL`, default `http://localhost:8547`). The
+proxy exists only under `npm run dev` / `npm run preview`; a static build shows
+the daemon as offline. The bar polls the daemon every 10s while it's up and
+every 60s while it's down, and reads it fresh on every prompt.
 
 ## Standalone Python scripts
 
