@@ -178,7 +178,8 @@ headers, so the browser reaches it same-origin through the `/daemon` proxy in
 `vite.config.js` (target `GUARDIAN_URL`, default `http://localhost:8547`). The
 proxy exists only under `npm run dev` / `npm run preview`; a static build shows
 the daemon as offline. The bar polls the daemon every 10s while it's up and
-every 60s while it's down, and reads it fresh on every prompt.
+every 60s while it's down, and reads it fresh on every prompt — that read also
+resets the poll cadence. The daemon fetch sends no cookies.
 
 ## Standalone Python scripts
 

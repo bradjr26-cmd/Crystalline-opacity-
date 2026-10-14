@@ -75,7 +75,8 @@ async function readDaemon() {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), DAEMON_TIMEOUT_MS);
   try {
-    const r = await fetch(DAEMON_STATUS_URL, { signal: ctrl.signal, cache: "no-store" });
+    // The daemon needs no cookies; don't carry other localhost apps' cookies to GUARDIAN_URL.
+    const r = await fetch(DAEMON_STATUS_URL, { signal: ctrl.signal, cache: "no-store", credentials: "omit" });
     return r.ok ? await r.json() : null;
   } catch {
     return null;
@@ -212,20 +213,29 @@ const MiniWave = ({ history, anomaly }) => {
   );
 };
 
+// Returns [status, report]. report(s) records a status read elsewhere (speak()
+// reads the daemon fresh) and re-arms the poll at the cadence that status calls
+// for, so a prompt that finds the daemon back up doesn't wait out the offline
+// back-off. One timer: a poll still in flight can't start a second loop.
 function useDaemon() {
   const [status, setStatus] = useState(undefined); // undefined: not checked yet; null: unreachable
+  const report = useRef(() => {});
   useEffect(() => {
     let live = true, timer;
-    const poll = async () => {
-      const s = await readDaemon();
-      if (!live) return;
+    const apply = (s) => {
       setStatus(s);
+      clearTimeout(timer);
       timer = setTimeout(poll, s ? DAEMON_POLL_MS : DAEMON_OFFLINE_POLL_MS);
     };
+    const poll = async () => {
+      const s = await readDaemon();
+      if (live) apply(s);
+    };
+    report.current = (s) => { if (live) apply(s); };
     poll();
     return () => { live = false; clearTimeout(timer); };
   }, []);
-  return [status, setStatus];
+  return [status, (s) => report.current(s)];
 }
 
 function consoleSnapshot(channels, targets) {
@@ -333,7 +343,10 @@ const SolBar = ({ channels, targets, narrow }) => {
           className="hm-input"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") speak(); }}
+          onKeyDown={(e) => {
+            // Skip the Enter that commits an IME composition (keyCode 229 on Safari).
+            if (e.key === "Enter" && !e.nativeEvent.isComposing && e.keyCode !== 229) speak();
+          }}
           placeholder="speak to sol — ask about the daemon or the scope"
           style={{ ...field, flex: "1 1 220px", minWidth: 0 }}
         />
@@ -355,7 +368,7 @@ const SolBar = ({ channels, targets, narrow }) => {
       )}
       {result && (
         <div style={{ display: "flex", gap: 14, alignItems: "flex-start", userSelect: "text" }}>
-          <div style={{ flex: 1, fontSize: 11, lineHeight: 1.6, color: "rgba(255,220,150,0.92)" }}>
+          <div style={{ flex: 1, minWidth: 0, overflowWrap: "anywhere", fontSize: 11, lineHeight: 1.6, color: "rgba(255,220,150,0.92)" }}>
             {result.reply}
           </div>
           <div style={{ flexShrink: 0, textAlign: "right" }}>
@@ -372,11 +385,11 @@ const SolBar = ({ channels, targets, narrow }) => {
         </div>
       )}
       {err && (
-        <div style={{ fontSize: 10, color: "rgba(255,100,60,0.9)", userSelect: "text" }}>{err}</div>
+        <div style={{ fontSize: 10, color: "rgba(255,100,60,0.9)", userSelect: "text", overflowWrap: "anywhere" }}>{err}</div>
       )}
       {!result && raw && (
         <pre style={{
-          margin: 0, fontSize: 10, whiteSpace: "pre-wrap", color: "rgba(126,200,135,0.6)",
+          margin: 0, fontSize: 10, whiteSpace: "pre-wrap", overflowWrap: "anywhere", color: "rgba(126,200,135,0.6)",
           fontFamily: "inherit", userSelect: "text",
         }}>{raw}</pre>
       )}
