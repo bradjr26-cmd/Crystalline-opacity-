@@ -5,11 +5,15 @@ import { useState, useEffect, useRef } from "react";
 // sample is smoothed by a moving average; when the filtered value strays past
 // THRESHOLD from BASELINE the channel reads ANOMALY and a contact is placed on
 // the scope. The operator walks each contact DETECTED → ACQUIRED → NEUTRALIZED.
-// Nothing here calls a model or a network; the signals are synthesized locally.
+// Nothing here calls a model or fetches data; the signals are synthesized
+// locally. The only request is the Google Fonts stylesheet every tool imports,
+// and Courier New stands in when it can't load.
 
 const MONO = "'JetBrains Mono', 'Courier New', ui-monospace, monospace";
 
 const BUFFER_LIMIT = 10;
+const MAX_CONTACTS = 9;  // log length; only neutralized contacts are evicted
+const STACK_BELOW = 720; // px; narrower viewports stack the panels vertically
 const BASELINE = 1.0;
 const THRESHOLD = 0.35;
 
@@ -31,6 +35,26 @@ const CHANNELS = [
 ];
 
 const randIn = ([lo, hi]) => lo + Math.random() * (hi - lo);
+
+// Trim the log to `max` by dropping the oldest neutralized contacts. Unresolved
+// contacts are never evicted, so the operator can always still act on them.
+function capLog(list, max) {
+  let excess = list.length - max;
+  return excess <= 0 ? list : list.filter(t => t.status !== "neutralized" || excess-- <= 0);
+}
+
+function useNarrow(px) {
+  const query = `(max-width: ${px - 1}px)`;
+  const [narrow, setNarrow] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const onChange = () => setNarrow(mq.matches);
+    mq.addEventListener("change", onChange);
+    onChange();
+    return () => mq.removeEventListener("change", onChange);
+  }, [query]);
+  return narrow;
+}
 
 // Advance one channel's disturbance state and return its next raw sample.
 function sample(d) {
@@ -85,7 +109,9 @@ function useHunter() {
   }, []);
 
   // Spawn a target when a channel trips (clear → anomaly). A channel that stays
-  // anomalous doesn't respawn a contact the operator has already neutralized.
+  // anomalous doesn't respawn a contact the operator has already neutralized,
+  // and a channel that re-trips while its contact is still open bumps that
+  // contact's hit count instead of stacking a second one.
   useEffect(() => {
     channels.forEach(ch => {
       const was = lastStatus.current[ch.id];
@@ -93,10 +119,10 @@ function useHunter() {
       if (ch.status !== "anomaly" || was === "anomaly") return;
       setTargets(prev => {
         const exists = prev.find(t => t.chId === ch.id && t.status !== "neutralized");
-        if (exists) return prev;
+        if (exists) return prev.map(t => t === exists ? { ...t, hits: t.hits + 1 } : t);
         const angle = Math.random() * 360;
         const r = 0.3 + Math.random() * 0.55;
-        return [...prev.slice(-8), {
+        return capLog([...prev, {
           id: `TGT-${Date.now()}-${ch.id}`,
           chId: ch.id,
           label: ch.label,
@@ -106,7 +132,8 @@ function useHunter() {
           status: "detected",
           delta: (ch.filtered - BASELINE).toFixed(3),
           ts: new Date().toISOString().slice(11, 19),
-        }];
+          hits: 1,
+        }], MAX_CONTACTS);
       });
     });
   }, [channels]);
@@ -139,6 +166,7 @@ const MiniWave = ({ history, anomaly }) => {
 
 export default function HunterMode() {
   const { channels, targets, radarAngle, acquire, neutralize } = useHunter();
+  const narrow = useNarrow(STACK_BELOW);
   const [tick, setTick] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setTick(n => n + 1), 60);
@@ -190,12 +218,16 @@ export default function HunterMode() {
         </div>
       </div>
 
-      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+      <div style={{
+        display: "flex", flex: 1,
+        flexDirection: narrow ? "column" : "row",
+        overflow: narrow ? "visible" : "hidden",
+      }}>
 
         {/* Left: Radar */}
         <div style={{
-          width: 280, flexShrink: 0,
-          borderRight: "1px solid rgba(100,200,140,0.1)",
+          width: narrow ? "auto" : 280, flexShrink: 0,
+          [narrow ? "borderBottom" : "borderRight"]: "1px solid rgba(100,200,140,0.1)",
           display: "flex", flexDirection: "column",
           alignItems: "center",
           padding: "24px 0",
@@ -264,7 +296,7 @@ export default function HunterMode() {
         {/* Center: Channels */}
         <div style={{
           flex: 1,
-          padding: "24px",
+          padding: narrow ? "24px 16px" : "24px",
           display: "flex", flexDirection: "column", gap: 2,
           overflowY: "auto",
         }}>
@@ -276,7 +308,7 @@ export default function HunterMode() {
             const c = anom ? "255,100,60" : "100,200,140";
             return (
               <div key={ch.id} style={{
-                display: "flex", alignItems: "center", gap: 16,
+                display: "flex", alignItems: "center", gap: narrow ? 10 : 16,
                 padding: "10px 14px",
                 border: `1px solid rgba(${c},${anom ? 0.25 : 0.08})`,
                 background: `rgba(${c},${anom ? 0.04 : 0.01})`,
@@ -287,7 +319,7 @@ export default function HunterMode() {
                   <div style={{ fontSize: 10, letterSpacing: "0.2em", color: `rgba(${c},0.9)` }}>{ch.label}</div>
                 </div>
                 <MiniWave history={ch.history} anomaly={anom} />
-                <div style={{ flex: 1, display: "flex", gap: 20, justifyContent: "flex-end" }}>
+                <div style={{ flex: 1, display: "flex", gap: narrow ? 12 : 20, justifyContent: "flex-end" }}>
                   {[
                     { l: "RAW", v: ch.signal.toFixed(3) },
                     { l: "FILT", v: ch.filtered.toFixed(3) },
@@ -314,8 +346,8 @@ export default function HunterMode() {
 
         {/* Right: Target log */}
         <div style={{
-          width: 220, flexShrink: 0,
-          borderLeft: "1px solid rgba(100,200,140,0.1)",
+          width: narrow ? "auto" : 220, flexShrink: 0,
+          [narrow ? "borderTop" : "borderLeft"]: "1px solid rgba(100,200,140,0.1)",
           display: "flex", flexDirection: "column",
           padding: "24px 0",
         }}>
@@ -344,7 +376,7 @@ export default function HunterMode() {
                     <span style={{ fontSize: 7, opacity: 0.35 }}>{t.ts}</span>
                   </div>
                   <div style={{ fontSize: 7, opacity: 0.4, letterSpacing: "0.15em", marginBottom: 6 }}>
-                    δ {t.delta} · {t.chId}
+                    δ {t.delta} · {t.chId}{t.hits > 1 ? ` · ×${t.hits}` : ""}
                   </div>
                   {t.status !== "neutralized" && (
                     <div style={{ display: "flex", gap: 4 }}>

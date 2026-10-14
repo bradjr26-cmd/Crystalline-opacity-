@@ -152,9 +152,14 @@ moving average filters it, and a channel reads ANOMALY when the filtered value
 is more than `THRESHOLD` from `BASELINE`. Background noise is bounded so it can
 never trip the detector on its own; contacts come only from injected
 disturbances (`DISTURB_*`). A contact spawns on a channel's clear → anomaly
-edge, and the operator walks it DETECTED → ACQUIRED → NEUTRALIZED. Sampling
-happens outside state updaters so StrictMode's double-invoked updaters stay
-pure — keep it that way if you touch the tick loop.
+edge, and the operator walks it DETECTED → ACQUIRED → NEUTRALIZED. A channel
+has at most one open contact: re-tripping while it's open bumps its hit count
+(`×n` in the log). The log is capped at `MAX_CONTACTS` by evicting only
+neutralized contacts, so an open one never disappears. Below `STACK_BELOW` px
+the three panels stack vertically. Sampling happens outside state updaters so
+StrictMode's double-invoked updaters stay pure — keep it that way if you touch
+the tick loop. Its only network request is the shared Google Fonts `@import`
+(Courier New is the fallback).
 
 ## Standalone Python scripts
 
