@@ -31,6 +31,8 @@ src/
 portability_layer.py  Standalone Python skeleton — "canon meeting" form-checker
 tidal_lines.py        Standalone Python script — tidal-signal discriminator (has a synthetic self-test)
 co_harness.py         Standalone Python script — scores detector "reads" against a planted answer key (has a self-test)
+opacity_retrieve.py   Standalone Python script — receipt on a retrieval cut: kept / rule-excluded / capacity-dropped (has a demo)
+opacity_fuse.py       Standalone Python script — receipt on context fusion, re-audits opacity_retrieve's (imports it; has a demo)
 guardian_hq_topology.html  Standalone static HTML report (network topology record)
 CRYSTLLINEUITests.swift   Orphaned Xcode UI-test stub — no surrounding Xcode project in this repo
 .env.example          Template for VITE_ANTHROPIC_API_KEY (and optional GUARDIAN_URL)
@@ -184,8 +186,9 @@ resets the poll cadence. The daemon fetch sends no cookies.
 
 ## Standalone Python scripts
 
-`portability_layer.py`, `tidal_lines.py` and `co_harness.py` are independent
-CLI scripts, not part of the Vite build and not imported by the React app. Each is
+`portability_layer.py`, `tidal_lines.py`, `co_harness.py`, `opacity_retrieve.py`
+and `opacity_fuse.py` are independent CLI scripts, not part of the Vite build and
+not imported by the React app. Each is
 self-documenting via a long module docstring explaining its purpose and
 design rationale — read that docstring before editing any of them.
 
@@ -211,6 +214,18 @@ design rationale — read that docstring before editing any of them.
   Python class (`--read file.py:Class`) or any executable speaking its JSON-lines
   contract (`--external`), which must flush stdout after every line. Keep runs
   seed-deterministic: the same seed must reproduce the same answer-key hash.
+- `opacity_retrieve.py` and `opacity_fuse.py` (stdlib only) are pipeline stages
+  that audit a RAG context rather than build one: crossing 3 (retrieval) and
+  crossing 4 (fusion). `opacity_fuse.py` imports `Candidate` from
+  `opacity_retrieve.py`, so keep them side by side. Run each with no args for its
+  built-in demo. Scores come from the caller's embedder; neither tool computes
+  similarity. Keep their invariants when editing: retrieval applies `min_score`,
+  then `top_k`, then `char_budget`, in that fixed order, and tells a rule
+  exclusion apart from a capacity drop; fusion decides what fits by relevance
+  *before* ordering, so the order strategy never changes which items are
+  dropped, and `assemble()` must build exactly what `fuse()` receipts. The
+  positional exposure curve is a labelled prior (FENCED), never reported as a
+  measurement.
 
 These scripts favor heavily-commented, prose-explained code over terse
 implementations — match that style if you extend them.

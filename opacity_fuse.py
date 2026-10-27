@@ -79,6 +79,29 @@ def _order(selected: List[Candidate], strategy: str) -> List[Candidate]:
     raise ValueError(f"unknown order strategy: {strategy}")
 
 
+def _fit(selected: List[Candidate], token_budget: int, sep_len: int):
+    """Decide which selected items fit the real budget - BEFORE any ordering.
+
+    Room is spent on relevance, highest score first, so when something has to go
+    it is the least relevant item, whatever order the context is laid out in
+    afterwards. (Deciding fit in layout order would let `sandwich`, which parks the
+    second-best item at the tail, drop that item and keep a weaker one.) The total
+    is order-independent: every fitted item's text plus one separator between each
+    adjacent pair. Returns (fitted, dropped, chars_used). `fitted` keeps the order
+    crossing 3 handed us, so `as-given` still means as-given; `dropped` is in rank
+    order.
+    """
+    keep, dropped, used = set(), [], 0
+    for c in sorted(selected, key=lambda c: c.score, reverse=True):
+        add = len(c.text) + (sep_len if keep else 0)
+        if used + add <= token_budget:
+            keep.add(id(c))
+            used += add
+        else:
+            dropped.append(c)
+    return [c for c in selected if id(c) in keep], dropped, used
+
+
 def _exposure(position: int, n: int) -> float:
     """FENCED prior. U-curve: head and tail = 1.0, dead middle -> 0.0.
     This is a stand-in for where attention probably goes, NOT a measurement of
@@ -108,39 +131,26 @@ def fuse(
     if not selected:
         return {"error": "nothing selected - crossing 3 returned an empty set"}
 
-    ordered = _order(selected, order)
-    n = len(ordered)
-    median_score = sorted(c.score for c in ordered)[n // 2]
-
-    placements: List[Placement] = []
-    used = 0
-    placed_index = 0
+    n = len(selected)
+    median_score = sorted(c.score for c in selected)[n // 2]
     sep_len = len(separator)
-    # first pass: decide fit in final order (MEASURED)
-    fit_flags = []
-    for c in ordered:
-        add = len(c.text) + (sep_len if placed_index > 0 else 0)
-        if used + add <= token_budget:
-            used += add
-            fit_flags.append(True)
-            placed_index += 1
-        else:
-            fit_flags.append(False)
 
-    n_fit = sum(fit_flags)
+    # first pass: decide fit by relevance (MEASURED), then lay out only the survivors
+    fitted, dropped_items, used = _fit(selected, token_budget, sep_len)
+    ordered = _order(fitted, order)
+    n_fit = len(ordered)
+
     # second pass: assign positions + exposure among the FITTED items only
-    pos = 0
-    for c, ok in zip(ordered, fit_flags):
-        if ok:
-            exp = _exposure(pos, n_fit)
-            note = "placed"
-            if c.score >= median_score and exp < dead_zone:
-                note = "FENCED RISK: high-relevance chunk in the attention dead zone"
-            placements.append(Placement(c.cid, c.score, pos, True, exp, note))
-            pos += 1
-        else:
-            placements.append(Placement(c.cid, c.score, -1, False, 0.0,
-                "MEASURED: dropped for room at fusion - crossing 3 could not see this"))
+    placements: List[Placement] = []
+    for pos, c in enumerate(ordered):
+        exp = _exposure(pos, n_fit)
+        note = "placed"
+        if c.score >= median_score and exp < dead_zone:
+            note = "FENCED RISK: high-relevance chunk in the attention dead zone"
+        placements.append(Placement(c.cid, c.score, pos, True, exp, note))
+    for c in dropped_items:
+        placements.append(Placement(c.cid, c.score, -1, False, 0.0,
+            "MEASURED: dropped for room at fusion - crossing 3 could not see this"))
 
     dropped = [p for p in placements if not p.fit]
     buried = [p for p in placements if p.fit and p.score >= median_score and p.exposure < dead_zone]
@@ -164,6 +174,9 @@ def fuse(
     # ---- the payload Brad asked for: what 4 does for 3 ----
     promised = len(selected)
     delivered = n_fit
+    # Crossing 3's char_budget counts only chunk text; fusion also spends a separator
+    # between each adjacent pair. Leave room for those or the re-run still over-promises.
+    honest_char_budget = max(0, token_budget - sep_len * (promised - 1))
     reverberation = {
         "crossing_3_promised": promised,        # what retrieval claimed it selected
         "fusion_delivered": delivered,          # what actually made it into context (MEASURED)
@@ -171,8 +184,9 @@ def fuse(
         "buried_in_dead_zone": len(buried),     # FENCED risk on top of that
         "verdict": (
             f"crossing 3's sovereignty was OPTIMISTIC: it counted {len(dropped)} item(s) as "
-            f"delivered that fusion dropped for room. Re-run crossing 3 with token_budget={token_budget} "
-            f"as char_budget to make its receipt honest."
+            f"delivered that fusion dropped for room. Re-run crossing 3 with "
+            f"char_budget={honest_char_budget} (token_budget {token_budget} minus the "
+            f"{promised - 1} separator(s) fusion adds) to make its receipt honest."
             if dropped else
             "crossing 3's selection was delivered in full at fusion; its receipt holds."),
     }
@@ -197,15 +211,10 @@ def fuse(
 
 def assemble(selected: List[Candidate], order: str = "score",
              separator: str = "\n\n---\n\n", token_budget: int = 10**9) -> str:
-    """Produce the actual fused context string for the items that fit, in order."""
-    ordered = _order(selected, order)
-    out, used, first = [], 0, True
-    for c in ordered:
-        add = len(c.text) + (0 if first else len(separator))
-        if used + add > token_budget:
-            continue
-        out.append(c.text); used += add; first = False
-    return separator.join(out)
+    """Produce the actual fused context string for the items that fit, in order.
+    Uses the same fit decision as fuse(), so the receipt describes this string."""
+    fitted, _, _ = _fit(selected, token_budget, len(separator))
+    return separator.join(c.text for c in _order(fitted, order))
 
 
 if __name__ == "__main__":

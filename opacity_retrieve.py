@@ -106,15 +106,15 @@ def _cut_shape(verdicts: List[Verdict]):
     The cut sits between the lowest-scoring KEPT item and the highest-scoring
     DROPPED item. We report two things about that seam:
 
-      gap     - score(last kept) - score(first dropped). A big gap means the
-                threshold sliced through a CLIFF: a real gap between in and out.
-                A tiny gap means it sliced through a PLATEAU: a dozen items sat
-                a hair apart and half made it for no principled reason.
-      pileup  - how many candidates sit within `band` of the cut. Dense pileup
-                at the cut is the plateau made countable.
-
-    If band is 0 we auto-size it to 10% of the score range so the pileup count
-    is meaningful on whatever scale your embedder uses.
+      gap          - score(last kept) - score(first dropped). A big gap means the
+                     threshold sliced through a CLIFF: a real gap between in and
+                     out. A tiny gap means it sliced through a PLATEAU: a dozen
+                     items sat a hair apart and half made it for no principled
+                     reason.
+      cliff_ratio  - the gap divided by the field's average step between adjacent
+                     ranked items. Unitless, so it reads the same on any scale your
+                     embedder uses. A field of tied scores has no steps at all; that
+                     is the purest plateau, so it reads 0, never "no reading".
     """
     kept = [v for v in verdicts if v.kept]
     dropped = [v for v in verdicts if not v.kept]
@@ -133,7 +133,8 @@ def _cut_shape(verdicts: List[Verdict]):
     scores = sorted((v.score for v in verdicts), reverse=True)
     steps = [scores[i] - scores[i + 1] for i in range(len(scores) - 1)]
     avg_step = sum(steps) / len(steps) if steps else 0.0
-    cliff_ratio = round(gap / avg_step, 2) if avg_step > 0 else None
+    # No steps means every score is tied (so the gap is 0 too): a pure plateau.
+    cliff_ratio = round(gap / avg_step, 2) if avg_step > 0 else 0.0
 
     return {"gap": gap, "avg_step": round(avg_step, 4), "cliff_ratio": cliff_ratio,
             "last_kept": last_kept, "first_dropped": first_dropped}
@@ -189,7 +190,13 @@ def receipt(
     if cap_excl or inverted:
         color = "red"      # protect - unaccountable suppression / silent edit
         verdict = "PROTECT - capacity drops or inverted cut. Evidence may be silently edited."
-    elif ratio is not None and ratio < CLIFF_THRESHOLD:
+    elif shape.get("gap") is None and kept:
+        color = "green"    # flow - nothing withheld, so there is no seam to judge
+        verdict = "FLOW - nothing was excluded; there is no cut to audit."
+    elif shape.get("gap") is None:
+        color = "yellow"   # hold - an empty context is not a seam either
+        verdict = "HOLD - nothing was selected; every candidate failed a rule. Check the rule before sending an empty context."
+    elif ratio < CLIFF_THRESHOLD:
         color = "yellow"   # hold - the cut sliced a plateau, not a seam
         verdict = "HOLD - cut-gap is within local spacing. The threshold invented a seam in a plateau."
     else:
