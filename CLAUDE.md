@@ -30,6 +30,7 @@ src/
   HunterMode.jsx         Tool: "Hunter Mode" — sweep-radar anomaly watch + Sol (Claude reading the Guardian daemon)
 portability_layer.py  Standalone Python skeleton — "canon meeting" form-checker
 tidal_lines.py        Standalone Python script — tidal-signal discriminator (has a synthetic self-test)
+co_harness.py         Standalone Python script — scores detector "reads" against a planted answer key (has a self-test)
 guardian_hq_topology.html  Standalone static HTML report (network topology record)
 CRYSTLLINEUITests.swift   Orphaned Xcode UI-test stub — no surrounding Xcode project in this repo
 .env.example          Template for VITE_ANTHROPIC_API_KEY (and optional GUARDIAN_URL)
@@ -183,10 +184,10 @@ resets the poll cadence. The daemon fetch sends no cookies.
 
 ## Standalone Python scripts
 
-`portability_layer.py` and `tidal_lines.py` are independent CLI scripts, not
-part of the Vite build and not imported by the React app. Each is
+`portability_layer.py`, `tidal_lines.py` and `co_harness.py` are independent
+CLI scripts, not part of the Vite build and not imported by the React app. Each is
 self-documenting via a long module docstring explaining its purpose and
-design rationale — read that docstring before editing either file.
+design rationale — read that docstring before editing any of them.
 
 - `tidal_lines.py` has **no external dependencies** and includes a synthetic
   self-test runnable with `python3 tidal_lines.py` (no args). Run it after any
@@ -198,8 +199,20 @@ design rationale — read that docstring before editing either file.
   `__main__` block is a runnable demo plus a negative-control case. Keep any
   changes deterministic and re-runnable (SHA-256 fingerprints/digests are the
   whole point — don't introduce non-reproducible state).
+- `co_harness.py` (stdlib only) replays HunterMode's signal model headlessly
+  (same four channels, 200 ms tick, uniform 0.65..1.35 noise), plants mean /
+  variance / lag-1 correlation events from a seeded RNG, hashes the answer key
+  so a run is a replayable receipt, and scores each read's alarm rising edges
+  for hits, misses, false alarms and lag. Run `python3 co_harness.py` (no
+  args) for the self-test — it must print `ALL PASS` — after any change to the
+  signal model, the event schedule or the scoring. Its constants mirror
+  `src/HunterMode.jsx` (`BUFFER_LIMIT`, `BASELINE`, `THRESHOLD`, noise range);
+  if you change those in the tool, change them here too. Reads plug in as a
+  Python class (`--read file.py:Class`) or any executable speaking its JSON-lines
+  contract (`--external`), which must flush stdout after every line. Keep runs
+  seed-deterministic: the same seed must reproduce the same answer-key hash.
 
-Both scripts favor heavily-commented, prose-explained code over terse
+These scripts favor heavily-commented, prose-explained code over terse
 implementations — match that style if you extend them.
 
 ## Standalone HTML / other files

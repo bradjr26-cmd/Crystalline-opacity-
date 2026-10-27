@@ -35,6 +35,10 @@ PLUG-IN CONTRACT
       in : {"tick": 41, "samples": {"CH-A": 1.02, ...}}
       out: {"CH-A": false, "CH-B": true, ...}
       last line in: {"tick": -1, "done": true}  -> reply {"baseline": {...}} or {}
+  Flush stdout after every reply line: a pipe is block-buffered by default, so an
+  unflushed reply never arrives (Swift: setvbuf(stdout, nil, _IOLBF, 0) once at start,
+  or fflush(stdout) after each print; Python: print(..., flush=True)). A read that
+  gives no reply within 10 s stops the run with an error instead of hanging it.
 
 LIVING BASELINE
   The true resting texture is known exactly here (variance below, lag-1 = 0), so a read
@@ -42,7 +46,7 @@ LIVING BASELINE
 
 USAGE
   python3 co_harness.py                          # self-test: mean vs control, 60 sim-min
-  python3 co_harness.py --noise gaussian         # unbounded noise, same spread
+  python3 co_harness.py --noise gaussian         # self-test on unbounded noise only, same spread
   python3 co_harness.py --read my_read.py:MyRead
   python3 co_harness.py --external "./CrystallineOpacityCLI"
   python3 co_harness.py --minutes 240 --seed 7 --json report.json --key key.jsonl
@@ -53,9 +57,11 @@ import hashlib
 import importlib.util
 import json
 import math
+import queue
 import random
 import subprocess
 import sys
+import threading
 from collections import deque
 
 VERSION = "co_harness 1.0"
@@ -180,16 +186,31 @@ class ControlRead:
 
 class ExternalRead:
     """Any executable, any language. Lockstep JSON lines over stdin/stdout."""
+    REPLY_TIMEOUT_S = 10.0
 
     def __init__(self, cmd, ids):
         self.name = f"external: {cmd}"
         self.p = subprocess.Popen(cmd, shell=True, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, text=True, bufsize=1)
+        # Replies are read on a thread so a read that never answers (usually: stdout
+        # not flushed per line) fails loudly instead of hanging the run forever.
+        self.lines = queue.Queue()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        for line in self.p.stdout:
+            self.lines.put(line)
+        self.lines.put("")                                      # EOF
 
     def _ask(self, obj):
         self.p.stdin.write(json.dumps(obj) + "\n")
         self.p.stdin.flush()
-        line = self.p.stdout.readline()
+        try:
+            line = self.lines.get(timeout=self.REPLY_TIMEOUT_S)
+        except queue.Empty:
+            self.p.kill()
+            raise RuntimeError(f"{self.name} gave no reply within {self.REPLY_TIMEOUT_S:g} s "
+                               "- does it flush stdout after every line?") from None
         if not line:
             raise RuntimeError(f"{self.name} closed its output")
         return json.loads(line)
@@ -326,10 +347,10 @@ def format_report(rep):
     return "\n".join(lines)
 
 
-def self_test(minutes, seed):
+def self_test(minutes, seed, noises=("uniform", "gaussian")):
     print("co_harness self-test - auditing the harness before trusting a score\n")
     ok = True
-    for noise in ("uniform", "gaussian"):
+    for noise in noises:
         rep, key = run(minutes, seed, noise)
         print(format_report(rep))
         mean, ctrl = rep["reads"]
@@ -358,7 +379,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Score reads against a known answer key.")
     ap.add_argument("--minutes", type=float, default=60.0)
     ap.add_argument("--seed", type=int, default=1)
-    ap.add_argument("--noise", choices=("uniform", "gaussian"), default="uniform")
+    ap.add_argument("--noise", choices=("uniform", "gaussian"), default=None,
+                    help="noise model (default uniform; the self-test runs both unless one is given)")
     ap.add_argument("--read", action="append", default=[], help="path/file.py:ClassName")
     ap.add_argument("--external", action="append", default=[], help="command speaking the JSON-lines contract")
     ap.add_argument("--no-control", action="store_true", help="score only the mean baseline and your read(s)")
@@ -367,12 +389,12 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     if not a.read and not a.external and not a.json and not a.key:
-        return 0 if self_test(a.minutes, a.seed) else 1
+        return 0 if self_test(a.minutes, a.seed, (a.noise,) if a.noise else ("uniform", "gaussian")) else 1
 
     reads = [MeanRead(CHANNELS)] + ([] if a.no_control else [ControlRead(CHANNELS)])
     reads += [load_python_read(s, CHANNELS) for s in a.read]
     reads += [ExternalRead(cmd, CHANNELS) for cmd in a.external]
-    rep, key = run(a.minutes, a.seed, a.noise, reads)
+    rep, key = run(a.minutes, a.seed, a.noise or "uniform", reads)
     print(format_report(rep))
     if a.json:
         with open(a.json, "w") as f:
