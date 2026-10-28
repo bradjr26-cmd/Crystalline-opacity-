@@ -11,16 +11,18 @@ import Foundation
 // Contract (kept identical to the original call site in
 // GuardianHeadless.swift):
 //
-//     let server = StatusServer(port: port, engine: engine)
+//     let server = StatusServer(port: port, engine: engine, probe: probe)
 //     server.start()
 //
 // Behaviour:
-//   GET /status   -> 200, application/json, body = engine.statusJSON()
-//   GET <other>   -> 404, application/json
-//   <other verb>  -> 405, application/json
+//   GET /status            -> 200, application/json, body = engine.statusJSON()
+//   GET /signals           -> 200, the latest sample of Hunter Mode's channels
+//   GET /signals?history=1 -> 200, the same plus the last 24 h of samples
+//   GET <other>            -> 404, application/json
+//   <other verb>           -> 405, application/json
 //
-// The server is READ-ONLY. It never mutates the engine; it only
-// calls the engine's thread-safe statusJSON() snapshot. It binds to
+// The server is READ-ONLY. It never mutates the engine or the probe; it
+// only calls their thread-safe snapshots (statusJSON, signalsJSON). It binds to
 // 0.0.0.0 so `curl localhost:<port>/status` works from any local
 // terminal, and accepts connections serially on a background queue —
 // a status probe has no need for concurrency.
@@ -30,14 +32,16 @@ final class StatusServer {
 
     private let port: UInt16
     private let engine: GuardianEngine
+    private let probe: SignalProbe?
 
     // The accept loop runs here so start() returns immediately and the
     // caller can drop into RunLoop.main.run().
     private let queue = DispatchQueue(label: "guardian.status", qos: .utility)
 
-    init(port: UInt16, engine: GuardianEngine) {
+    init(port: UInt16, engine: GuardianEngine, probe: SignalProbe? = nil) {
         self.port = port
         self.engine = engine
+        self.probe = probe
     }
 
     // MARK: - Lifecycle
@@ -120,9 +124,12 @@ final class StatusServer {
         if request.hasPrefix("GET /status") {
             statusLine = "HTTP/1.1 200 OK"
             body = engine.statusJSON()
+        } else if request.hasPrefix("GET /signals"), let probe = probe {
+            statusLine = "HTTP/1.1 200 OK"
+            body = probe.signalsJSON(includeHistory: request.hasPrefix("GET /signals?history"))
         } else if request.hasPrefix("GET ") {
             statusLine = "HTTP/1.1 404 Not Found"
-            body = #"{"error":"not found","hint":"try GET /status"}"#
+            body = #"{"error":"not found","hint":"try GET /status or GET /signals"}"#
         } else {
             statusLine = "HTTP/1.1 405 Method Not Allowed"
             body = #"{"error":"method not allowed","allow":"GET"}"#

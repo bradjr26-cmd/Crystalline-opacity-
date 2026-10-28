@@ -1,37 +1,47 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 
 // ── Guardian · Hunter Mode ───────────────────────────────────────────────────
-// A sweep-radar watch over four simulated signal channels. Each channel's raw
-// sample is smoothed by a moving average; when the filtered value strays past
-// THRESHOLD from BASELINE the channel reads ANOMALY and a contact is placed on
-// the scope. The operator walks each contact DETECTED → ACQUIRED → NEUTRALIZED.
-// The signals are synthesized locally. Sol, the prompt under the top bar, is
-// Claude: it reads the Guardian daemon's /status (through Vite's /daemon proxy)
-// plus this console's state, and answers the operator. Sol only reads.
+// A sweep-radar watch over three REAL signal channels the Guardian daemon
+// measures on the Mac (guardian/Sources/guardian/SignalProbe.swift, GET /signals):
+//   AUTH  failed authentications in the unified log, per 5 s sample
+//   NET   established outbound TCP connections on en0
+//   HASH  evidence-vault files whose SHA-256 no longer matches the ledger
+// Each channel's threshold is set from this machine's own measured baseline,
+// not a constant. When a channel crosses it, a contact goes on the scope and
+// the operator walks it DETECTED → ACQUIRED → NEUTRALIZED. Nothing here is
+// synthesized: a source that is down reads NO SIGNAL, never zero. Sol, the
+// prompt under the top bar, is Claude: it reads the daemon's /status plus this
+// console's state, and answers the operator. Sol only reads.
 
 const MONO = "'JetBrains Mono', 'Courier New', ui-monospace, monospace";
 
-const BUFFER_LIMIT = 10;
 const MAX_CONTACTS = 9;  // log length; only neutralized contacts are evicted
 const STACK_BELOW = 720; // px; narrower viewports stack the panels vertically
-const BASELINE = 1.0;
-const THRESHOLD = 0.35;
 
-// Background noise alone can never trip the detector: every noise sample lies
-// in [0.65, 1.35), so no average of them can stray more than 0.35 from
-// BASELINE. Contacts come from disturbances — a sustained offset on one channel
-// that the moving average picks up after several ticks.
-const NOISE_LO = 0.65;
-const NOISE_SPAN = 0.7;
-const DISTURB_CHANCE = 0.006;        // per channel per tick (~every 30s per channel)
-const DISTURB_TICKS = [15, 40];      // duration, in 200ms ticks
-const DISTURB_OFFSET = [0.5, 0.65];  // magnitude; sign is random
+// ── Signals ──────────────────────────────────────────────────────────────────
+// Reached through vite.config.js's /daemon proxy, like Sol's /status.
+const SIGNALS_URL = "/daemon/signals";
+const SIGNAL_POLL_MS = 5000;           // the daemon samples every 5 s
+const SIGNAL_OFFLINE_POLL_MS = 30000;  // back off while it's unreachable (each miss is a proxy error in dev)
+const HISTORY_TIMEOUT_MS = 8000;       // the first read carries up to 24 h of samples
+const HISTORY_CAP = 17280;             // 24 h of 5 s samples, the same as the daemon keeps
+const SPARK_SAMPLES = 60;              // each row's sparkline shows the last 5 min
+
+// Thresholds come from the machine's own baseline, not a constant:
+//   threshold = median + max(K_SPREAD × 1.4826 × MAD, MIN_STEP)
+// over every sample the daemon has kept (up to 24 h). Median and MAD (median
+// absolute deviation) shrug off the anomalies inside the window. MIN_STEP keeps a
+// perfectly quiet channel (MAD 0) from alarming on nothing: it must rise by at
+// least one whole count. HASH has no learned baseline: the vault ledger IS its
+// SHA-256 baseline, so a single drifted file is an anomaly by definition.
+const K_SPREAD = 4;
+const MIN_STEP = 1;
+const CALIBRATION_MIN = 60;            // 5 min of samples before a learned threshold is trusted
 
 const CHANNELS = [
-  { id: "CH-A", freq: 820, label: "ALPHA" },
-  { id: "CH-B", freq: 1240, label: "BETA" },
-  { id: "CH-C", freq: 440, label: "GAMMA" },
-  { id: "CH-D", freq: 2100, label: "DELTA" },
+  { id: "CH-A", key: "failed_auths", label: "AUTH", what: "failed authentications / 5 s", baseline: "learned" },
+  { id: "CH-B", key: "outbound",     label: "NET",  what: "outbound TCP connections",     baseline: "learned" },
+  { id: "CH-C", key: "hash_drift",   label: "HASH", what: "vault files off their SHA-256", baseline: "ledger" },
 ];
 
 // ── Sol ──────────────────────────────────────────────────────────────────────
@@ -49,11 +59,11 @@ const SOL_MODEL = "claude-opus-5-5";
 const SOL_SYSTEM = `You are Sol, the voice of a Guardian "Hunter Mode" console. The operator speaks to you; you answer about the Guardian daemon and the console. Return ONLY a JSON object — no prose, no markdown, no backticks.
 
 GROUND RULES:
-- Facts about the daemon come ONLY from the DAEMON STATUS JSON in the message. Never invent fields, values, history or causes it does not show. If DAEMON STATUS is "unreachable", say the daemon cannot be reached and do not describe its state.
-- The console's channels and contacts are SIMULATED signals synthesized in the browser, not sensor data. Never present them as real detections; say they are simulated when it matters to the answer.
+- Facts come ONLY from the DAEMON STATUS JSON and the CONSOLE section in the message. Never invent fields, values, history or causes they do not show. If DAEMON STATUS is "unreachable", say the daemon cannot be reached and do not describe its state.
+- The console's channels are REAL counts the daemon measured on this Mac: AUTH = failed authentications in the last 5 s, NET = established outbound TCP connections on the named interface, HASH = evidence-vault files whose SHA-256 no longer matches the ledger (or are missing). AUTH and NET thresholds are learned from the machine's own baseline; HASH alarms on any drift. A threshold crossing is an anomaly to look at, not proof of an attack: never claim an intrusion, name an attacker, or give a cause the data does not show. A channel with no reading, or still calibrating, tells you nothing about that signal — say so.
 - You can read the daemon and the console but cannot change either. Never claim to have acted.
 - reply <= 60 words, plain and direct.
-- grounding: integer 0-3 = how much of the reply rests on the provided status and console data (0 none — general talk, or the daemon is unreachable and the answer needed it; 3 read entirely from the data).
+- grounding: integer 0-3 = how much of the reply rests on the provided status and console data (0 none — general talk, or the data the answer needed is missing; 3 read entirely from the data).
 
 Return EXACTLY:
 {"reply":"...","grounding":N}`;
@@ -68,7 +78,7 @@ const SOL_SCHEMA = {
   additionalProperties: false,
 };
 
-const randIn = ([lo, hi]) => lo + Math.random() * (hi - lo);
+const fmt = (x) => (Number.isInteger(x) ? String(x) : x.toFixed(1));
 
 // GET the daemon's status JSON, or null when it can't be reached in time.
 async function readDaemon() {
@@ -83,6 +93,104 @@ async function readDaemon() {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// GET /signals. Tells an unreachable daemon apart from an old build without the route.
+async function readSignals(withHistory) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), withHistory ? HISTORY_TIMEOUT_MS : DAEMON_TIMEOUT_MS);
+  try {
+    const r = await fetch(withHistory ? `${SIGNALS_URL}?history=1` : SIGNALS_URL,
+      { signal: ctrl.signal, cache: "no-store", credentials: "omit" });
+    if (r.status === 404) return { ok: false, phase: "no-endpoint", note: "the daemon answers but has no /signals — rebuild guardian" };
+    if (!r.ok) return { ok: false, phase: "offline", note: `daemon unreachable (HTTP ${r.status})` };
+    return { ok: true, data: await r.json() };
+  } catch {
+    return { ok: false, phase: "offline", note: "daemon unreachable" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const valueOf = (data, key) => {
+  const v = data?.channels?.[key]?.value;
+  return typeof v === "number" ? v : null;
+};
+
+// Pure (setState updaters run twice under StrictMode). The daemon's own history
+// replaces ours when it sends one; otherwise the new sample is appended once.
+function mergeHistory(prev, data) {
+  const h = data.history;
+  if (h && Array.isArray(h.t)) {
+    const out = { t: h.t.slice(-HISTORY_CAP) };
+    CHANNELS.forEach(c => { out[c.key] = (h[c.key] || []).slice(-HISTORY_CAP).map(v => (typeof v === "number" ? v : null)); });
+    return out;
+  }
+  const t = data.sampled_at;
+  if (!t) return prev;                                       // the daemon hasn't sampled yet
+  if (prev && prev.t.length && t <= prev.t[prev.t.length - 1]) return prev;   // same sample again
+  const base = prev || { t: [], ...Object.fromEntries(CHANNELS.map(c => [c.key, []])) };
+  const cut = base.t.length >= HISTORY_CAP ? 1 : 0;
+  const out = { t: [...base.t.slice(cut), t] };
+  CHANNELS.forEach(c => { out[c.key] = [...base[c.key].slice(cut), valueOf(data, c.key)]; });
+  return out;
+}
+
+// Poll /signals: the first good read asks for the daemon's history, later ones
+// only for the latest sample. One timer, backed off while the daemon is down.
+function useSignals() {
+  const [feed, setFeed] = useState({ phase: "connecting", note: "", latest: null, history: null });
+  useEffect(() => {
+    let live = true, timer, seeded = false;
+    const poll = async () => {
+      const r = await readSignals(!seeded);
+      if (!live) return;
+      if (r.ok) {
+        if (r.data.history) seeded = true;
+        setFeed(f => ({ phase: "live", note: "", latest: r.data, history: mergeHistory(f.history, r.data) }));
+      } else {
+        setFeed(f => ({ ...f, phase: r.phase, note: r.note }));
+      }
+      timer = setTimeout(poll, r.ok ? SIGNAL_POLL_MS : SIGNAL_OFFLINE_POLL_MS);
+    };
+    poll();
+    return () => { live = false; clearTimeout(timer); };
+  }, []);
+  return feed;
+}
+
+const median = (sorted) => {
+  const n = sorted.length, m = n >> 1;
+  return n % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2;
+};
+
+// The channel's resting level and the line it has to cross, from its own history.
+function measureBaseline(values, kind) {
+  if (kind === "ledger") return { center: 0, spread: 0, threshold: 1, n: values.length, calibrating: false };
+  const xs = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (xs.length < CALIBRATION_MIN) return { n: xs.length, calibrating: true };
+  const center = median(xs);
+  const spread = 1.4826 * median(xs.map(x => Math.abs(x - center)).sort((a, b) => a - b));
+  return { center, spread, threshold: center + Math.max(K_SPREAD * spread, MIN_STEP), n: xs.length, calibrating: false };
+}
+
+// Live channel rows: current value, learned baseline, and a status that never
+// pretends — no reading is "no-signal", too little history is "calibrating".
+function useChannels(feed) {
+  return useMemo(() => CHANNELS.map(c => {
+    const values = feed.history?.[c.key] || [];
+    const src = feed.latest?.channels?.[c.key];
+    const value = feed.phase === "live" ? valueOf(feed.latest, c.key) : null;
+    const base = measureBaseline(values, c.baseline);
+    const status = value === null ? "no-signal"
+      : base.calibrating ? "calibrating"
+      : value >= base.threshold ? "anomaly" : "clear";
+    const note = feed.phase !== "live" ? feed.note
+      : value === null ? (src?.note || "no reading")
+      : base.calibrating ? `calibrating ${base.n}/${CALIBRATION_MIN}` : "";
+    const what = c.key === "outbound" && src?.interface ? `outbound TCP connections on ${src.interface}` : c.what;
+    return { ...c, what, value, base, status, note, spark: values.slice(-SPARK_SAMPLES) };
+  }), [feed]);
 }
 
 // Trim the log to `max` by dropping the oldest neutralized contacts. Unresolved
@@ -105,56 +213,16 @@ function useNarrow(px) {
   return narrow;
 }
 
-// Advance one channel's disturbance state and return its next raw sample.
-function sample(d) {
-  if (d.ticks > 0) {
-    d.ticks--;
-  } else if (Math.random() < DISTURB_CHANCE) {
-    d.ticks = Math.round(randIn(DISTURB_TICKS));
-    d.offset = (Math.random() < 0.5 ? -1 : 1) * randIn(DISTURB_OFFSET);
-  }
-  const noise = NOISE_LO + Math.random() * NOISE_SPAN;
-  return noise + (d.ticks > 0 ? d.offset : 0);
-}
-
 function useHunter() {
-  const buffers = useRef({});
-  const disturbances = useRef({});
+  const feed = useSignals();
+  const channels = useChannels(feed);
   const lastStatus = useRef({});
-  const [channels, setChannels] = useState(() =>
-    CHANNELS.map(c => ({ ...c, signal: 1.0, filtered: 1.0, status: "clear", history: [] }))
-  );
   const [targets, setTargets] = useState([]);
   const [radarAngle, setRadarAngle] = useState(0);
 
   useEffect(() => {
-    const loop = setInterval(() => {
-      setRadarAngle(a => (a + 2.5) % 360);
-
-      // Sample and filter here rather than inside the setChannels updater:
-      // StrictMode runs updaters twice, which would double-push every sample.
-      const readings = {};
-      CHANNELS.forEach(({ id }) => {
-        if (!buffers.current[id]) buffers.current[id] = [];
-        if (!disturbances.current[id]) disturbances.current[id] = { ticks: 0, offset: 0 };
-        const raw = sample(disturbances.current[id]);
-        const buf = buffers.current[id];
-        buf.push(raw);
-        if (buf.length > BUFFER_LIMIT) buf.shift();
-        readings[id] = { raw, avg: buf.reduce((a, b) => a + b, 0) / buf.length };
-      });
-
-      setChannels(prev => prev.map(ch => {
-        const { raw, avg } = readings[ch.id];
-        const unstable = Math.abs(avg - BASELINE) > THRESHOLD;
-        return {
-          ...ch, signal: raw, filtered: avg,
-          status: unstable ? "anomaly" : "clear",
-          history: [...(ch.history || []).slice(-30), avg],
-        };
-      }));
-    }, 200);
-    return () => clearInterval(loop);
+    const sweep = setInterval(() => setRadarAngle(a => (a + 2.5) % 360), 200);
+    return () => clearInterval(sweep);
   }, []);
 
   // Spawn a target when a channel trips (clear → anomaly). A channel that stays
@@ -171,6 +239,7 @@ function useHunter() {
         if (exists) return prev.map(t => t === exists ? { ...t, hits: t.hits + 1 } : t);
         const angle = Math.random() * 360;
         const r = 0.3 + Math.random() * 0.55;
+        const d = ch.value - ch.base.center;
         return capLog([...prev, {
           id: `TGT-${Date.now()}-${ch.id}`,
           chId: ch.id,
@@ -179,7 +248,8 @@ function useHunter() {
           x: 50 + r * 47 * Math.cos((angle * Math.PI) / 180),
           y: 50 + r * 47 * Math.sin((angle * Math.PI) / 180),
           status: "detected",
-          delta: (ch.filtered - BASELINE).toFixed(3),
+          delta: `${d >= 0 ? "+" : ""}${fmt(d)}`,
+          value: ch.value,
           ts: new Date().toISOString().slice(11, 19),
           hits: 1,
         }], MAX_CONTACTS);
@@ -190,21 +260,34 @@ function useHunter() {
   const acquire = (id) => setTargets(p => p.map(t => t.id === id ? { ...t, status: "acquired" } : t));
   const neutralize = (id) => setTargets(p => p.map(t => t.id === id ? { ...t, status: "neutralized" } : t));
 
-  return { channels, targets, radarAngle, acquire, neutralize };
+  return { feed, channels, targets, radarAngle, acquire, neutralize };
 }
 
-const MiniWave = ({ history, anomaly }) => {
+const STATUS_RGB = {
+  anomaly: "255,100,60",
+  clear: "100,200,140",
+  calibrating: "255,200,60",
+  "no-signal": "80,120,90",
+};
+
+// Counts are never negative, so the sparkline's floor is 0 and its ceiling is
+// whichever is higher: the recent peak or a little above the threshold (dashed).
+const MiniWave = ({ values, threshold, c }) => {
   const W = 80, H = 24;
-  const pts = history.map((v, i) => {
-    const x = (i / (history.length - 1 || 1)) * W;
-    const y = H / 2 - (v - BASELINE) * 35;
-    return `${x},${Math.max(1, Math.min(H - 1, y))}`;
-  }).join(" ");
-  const c = anomaly ? "255,100,60" : "100,200,140";
+  const finite = values.filter(Number.isFinite);
+  const top = Math.max(1, ...finite, Number.isFinite(threshold) ? threshold * 1.25 : 0);
+  const y = v => H - 1 - (v / top) * (H - 2);
+  const pts = values
+    .map((v, i) => (Number.isFinite(v) ? `${(i / (values.length - 1 || 1)) * W},${y(v)}` : null))
+    .filter(Boolean).join(" ");
   return (
-    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: "block" }}>
-      <line x1={0} y1={H/2} x2={W} y2={H/2} stroke={`rgba(${c},0.1)`} strokeWidth={0.5} />
-      {history.length > 1 && (
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{ display: "block", flexShrink: 0 }}>
+      <line x1={0} y1={H - 1} x2={W} y2={H - 1} stroke={`rgba(${c},0.1)`} strokeWidth={0.5} />
+      {Number.isFinite(threshold) && (
+        <line x1={0} y1={y(threshold)} x2={W} y2={y(threshold)}
+          stroke={`rgba(${c},0.35)`} strokeWidth={0.5} strokeDasharray="2 2" />
+      )}
+      {finite.length > 1 && (
         <polyline points={pts} fill="none"
           stroke={`rgba(${c},0.9)`} strokeWidth={1}
           style={{ filter: `drop-shadow(0 0 2px rgba(${c},1))` }} />
@@ -239,11 +322,16 @@ function useDaemon() {
 }
 
 function consoleSnapshot(channels, targets) {
-  const ch = channels.map(c =>
-    `${c.label} ${c.status} filtered=${c.filtered.toFixed(3)} delta=${(c.filtered - BASELINE).toFixed(3)}`);
+  const ch = channels.map(c => {
+    const b = c.base;
+    const reading = c.value === null ? `no reading (${c.note})`
+      : b.calibrating ? `now=${c.value}, baseline still calibrating (${b.n}/${CALIBRATION_MIN} samples)`
+      : `now=${c.value} baseline=${fmt(b.center)} threshold=${fmt(b.threshold)}`;
+    return `${c.label} (${c.what}): ${c.status}, ${reading}`;
+  });
   const open = targets.filter(t => t.status !== "neutralized").map(t =>
-    `${t.label} ${t.status} delta=${t.delta} hits=${t.hits} since ${t.ts} UTC`);
-  return `channels (simulated):\n${ch.join("\n")}\nopen contacts:\n${open.length ? open.join("\n") : "none"}`;
+    `${t.label} ${t.status} value=${t.value} delta=${t.delta} hits=${t.hits} since ${t.ts} UTC`);
+  return `channels (real counts from the daemon's /signals, thresholds from this machine's own baseline):\n${ch.join("\n")}\nopen contacts:\n${open.length ? open.join("\n") : "none"}`;
 }
 
 const SolBar = ({ channels, targets, narrow }) => {
@@ -398,7 +486,7 @@ const SolBar = ({ channels, targets, narrow }) => {
 };
 
 export default function HunterMode() {
-  const { channels, targets, radarAngle, acquire, neutralize } = useHunter();
+  const { feed, channels, targets, radarAngle, acquire, neutralize } = useHunter();
   const narrow = useNarrow(STACK_BELOW);
   const [tick, setTick] = useState(0);
   useEffect(() => {
@@ -407,7 +495,20 @@ export default function HunterMode() {
   }, []);
 
   const activeTargets = targets.filter(t => t.status !== "neutralized");
-  const totalAnomalies = channels.filter(c => c.status === "anomaly").length;
+  const count = (st) => channels.filter(c => c.status === st).length;
+  const anomalies = count("anomaly"), calibrating = count("calibrating"), noSignal = count("no-signal");
+  const live = channels.length - noSignal;
+  // The headline never claims more than the channels show: "ALL CLEAR" only when
+  // every channel has a reading, and a missing source is always named.
+  const headline =
+    feed.phase === "offline" ? { text: "○ NO SIGNAL · DAEMON UNREACHABLE", rgb: STATUS_RGB["no-signal"] }
+    : feed.phase === "no-endpoint" ? { text: "○ NO SIGNAL · DAEMON HAS NO /signals", rgb: STATUS_RGB["no-signal"] }
+    : feed.phase === "connecting" ? { text: "○ CONNECTING TO DAEMON…", rgb: STATUS_RGB["no-signal"] }
+    : anomalies ? { text: `● ${anomalies} ANOMAL${anomalies > 1 ? "IES" : "Y"}`, rgb: STATUS_RGB.anomaly }
+    : calibrating ? { text: "◐ CALIBRATING BASELINE", rgb: STATUS_RGB.calibrating }
+    : live ? { text: noSignal ? "● CLEAR" : "● ALL CLEAR", rgb: STATUS_RGB.clear }
+    : { text: "○ NO SIGNAL", rgb: STATUS_RGB["no-signal"] };
+  const headlineSuffix = feed.phase === "live" && noSignal && live ? ` · ${noSignal} NO SIGNAL` : "";
 
   return (
     <div style={{
@@ -442,8 +543,8 @@ export default function HunterMode() {
       }}>
         <div style={{ display: "flex", gap: 24, alignItems: "center" }}>
           <span style={{ fontSize: 9, letterSpacing: "0.4em", opacity: 0.4 }}>GUARDIAN</span>
-          <span style={{ fontSize: 9, letterSpacing: "0.3em", color: totalAnomalies > 0 ? "#FF6440" : "#7EC887", opacity: 0.8 }}>
-            {totalAnomalies > 0 ? `● ${totalAnomalies} ANOMAL${totalAnomalies > 1 ? "IES" : "Y"}` : "● ALL CLEAR"}
+          <span style={{ fontSize: 9, letterSpacing: "0.3em", color: `rgb(${headline.rgb})`, opacity: 0.85 }}>
+            {headline.text}{headlineSuffix}
           </span>
         </div>
         <div style={{ display: "flex", gap: 20, fontSize: 8, opacity: 0.3, letterSpacing: "0.25em" }}>
@@ -539,9 +640,15 @@ export default function HunterMode() {
           <div style={{ fontSize: 8, letterSpacing: "0.35em", opacity: 0.3, marginBottom: 12 }}>
             SIGNAL CHANNELS
           </div>
+          {feed.phase !== "live" && feed.note && (
+            <div style={{ fontSize: 8, letterSpacing: "0.15em", opacity: 0.45, marginBottom: 8 }}>{feed.note}</div>
+          )}
           {channels.map(ch => {
             const anom = ch.status === "anomaly";
-            const c = anom ? "255,100,60" : "100,200,140";
+            const c = STATUS_RGB[ch.status];
+            const b = ch.base;
+            const learned = ch.value !== null && !b.calibrating;
+            const d = learned ? ch.value - b.center : null;
             return (
               <div key={ch.id} style={{
                 display: "flex", alignItems: "center", gap: narrow ? 10 : 16,
@@ -554,12 +661,18 @@ export default function HunterMode() {
                   <div style={{ fontSize: 7, letterSpacing: "0.3em", opacity: 0.4, marginBottom: 2 }}>{ch.id}</div>
                   <div style={{ fontSize: 10, letterSpacing: "0.2em", color: `rgba(${c},0.9)` }}>{ch.label}</div>
                 </div>
-                <MiniWave history={ch.history} anomaly={anom} />
+                <div style={{ flexShrink: 0 }}>
+                  <MiniWave values={ch.spark} threshold={learned ? b.threshold : NaN} c={c} />
+                  <div style={{ fontSize: 6, letterSpacing: "0.1em", opacity: 0.35, marginTop: 3, maxWidth: 80, overflowWrap: "anywhere" }}>
+                    {ch.note || ch.what}
+                  </div>
+                </div>
                 <div style={{ flex: 1, display: "flex", gap: narrow ? 12 : 20, justifyContent: "flex-end" }}>
                   {[
-                    { l: "RAW", v: ch.signal.toFixed(3) },
-                    { l: "FILT", v: ch.filtered.toFixed(3) },
-                    { l: "δ", v: (ch.filtered - BASELINE >= 0 ? "+" : "") + (ch.filtered - BASELINE).toFixed(3) },
+                    { l: "NOW", v: ch.value === null ? "—" : fmt(ch.value) },
+                    { l: "BASE", v: learned ? fmt(b.center) : "—" },
+                    { l: "THR", v: learned ? fmt(b.threshold) : "—" },
+                    { l: "δ", v: d === null ? "—" : `${d >= 0 ? "+" : ""}${fmt(d)}` },
                   ].map(({ l, v }) => (
                     <div key={l} style={{ textAlign: "right" }}>
                       <div style={{ fontSize: 7, opacity: 0.25, letterSpacing: "0.2em", marginBottom: 2 }}>{l}</div>

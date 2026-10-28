@@ -27,7 +27,7 @@ src/
   GuardianLens.jsx    Tool: "GuardianLens" — bounded multi-agent rigor instrument
   GroundwaterLevels.jsx  Tool: USGS NWIS Ohio groundwater-level viewer
   CrystalComposer.jsx    Tool: "Crystal Composer" — local ballast/Helios/Guardian agent composer
-  HunterMode.jsx         Tool: "Hunter Mode" — sweep-radar anomaly watch + Sol (Claude reading the Guardian daemon)
+  HunterMode.jsx         Tool: "Hunter Mode" — sweep-radar watch over the Guardian daemon's real signals + Sol (Claude)
 portability_layer.py  Standalone Python skeleton — "canon meeting" form-checker
 tidal_lines.py        Standalone Python script — tidal-signal discriminator (has a synthetic self-test)
 co_harness.py         Standalone Python script — scores detector "reads" against a planted answer key (has a self-test)
@@ -155,27 +155,37 @@ in-page compiled record only — nothing is sent anywhere, and any change to the
 facet set invalidates it. Keep it network-free and keep the gating semantics if
 you extend it.
 
-### HunterMode (Sol: Claude + the Guardian daemon)
+### HunterMode (real signals from the Guardian daemon + Sol)
 
-A local sweep-radar watch over four synthesized signal channels, in a green CRT
-palette. Each tick (200ms) every channel takes a raw sample, a `BUFFER_LIMIT`
-moving average filters it, and a channel reads ANOMALY when the filtered value
-is more than `THRESHOLD` from `BASELINE`. Background noise is bounded so it can
-never trip the detector on its own; contacts come only from injected
-disturbances (`DISTURB_*`). A contact spawns on a channel's clear → anomaly
-edge, and the operator walks it DETECTED → ACQUIRED → NEUTRALIZED. A channel
-has at most one open contact: re-tripping while it's open bumps its hit count
-(`×n` in the log). The log is capped at `MAX_CONTACTS` by evicting only
-neutralized contacts, so an open one never disappears. Below `STACK_BELOW` px
-the three panels stack vertically. Sampling happens outside state updaters so
-StrictMode's double-invoked updaters stay pure — keep it that way if you touch
-the tick loop.
+A sweep-radar watch, in a green CRT palette, over three REAL channels that the
+Guardian daemon (`guardian/`, Swift, macOS — see `SignalProbe.swift`) measures
+and serves at `GET /signals`: **AUTH** failed authentications per 5 s from the
+unified log, **NET** established outbound TCP connections on en0, **HASH**
+evidence-vault files whose SHA-256 no longer matches `~/vault/integrity.log`.
+Nothing is synthesized. A source that is down reports `null` and its row reads
+NO SIGNAL with the daemon's reason; never substitute 0 or simulated data, and
+the headline never says ALL CLEAR unless every channel has a reading.
+Thresholds come from the machine's own baseline, not constants: AUTH and NET
+use `median + max(K_SPREAD × 1.4826 × MAD, MIN_STEP)` over up to 24 h of the
+daemon's history (`?history=1` on the first read), and read CALIBRATING until
+`CALIBRATION_MIN` samples exist; HASH's baseline is the ledger itself, so any
+drift ≥ 1 is an anomaly. `/signals` is polled every 5 s (30 s while the daemon
+is down) and is counts-only because the daemon serves it on the LAN — keep
+names, addresses and paths out of it. A contact spawns on a channel's
+clear → anomaly edge, and the operator walks it DETECTED → ACQUIRED →
+NEUTRALIZED. A channel has at most one open contact: re-tripping while it's
+open bumps its hit count (`×n` in the log). The log is capped at
+`MAX_CONTACTS` by evicting only neutralized contacts, so an open one never
+disappears. Below `STACK_BELOW` px the three panels stack vertically. State
+updaters stay pure (`mergeHistory` copies, never mutates) because StrictMode
+runs them twice.
 
 **Sol** is the prompt bar under the top bar: the operator speaks, and Sol
 (Claude) answers from the Guardian daemon's `GET /status` plus a snapshot of
-the console (channels, open contacts). Sol only reads — the daemon stays
-read-only and Sol's prompt forbids claiming to have acted, inventing daemon
-facts, or treating the simulated channels as real detections; its `grounding`
+the console (channels with their learned baselines, open contacts). Sol only
+reads — the daemon stays read-only and Sol's prompt forbids claiming to have
+acted, inventing facts, or treating a threshold crossing as proof of an
+attack; its `grounding`
 self-score (0–3) drives the meter beside each reply. The daemon sends no CORS
 headers, so the browser reaches it same-origin through the `/daemon` proxy in
 `vite.config.js` (target `GUARDIAN_URL`, default `http://localhost:8547`). The
@@ -202,15 +212,15 @@ design rationale — read that docstring before editing any of them.
   `__main__` block is a runnable demo plus a negative-control case. Keep any
   changes deterministic and re-runnable (SHA-256 fingerprints/digests are the
   whole point — don't introduce non-reproducible state).
-- `co_harness.py` (stdlib only) replays HunterMode's signal model headlessly
-  (same four channels, 200 ms tick, uniform 0.65..1.35 noise), plants mean /
+- `co_harness.py` (stdlib only) replays the simulated signal model Hunter Mode
+  used before it read real signals (four channels, 200 ms tick, uniform
+  0.65..1.35 noise) as a fixed benchmark, plants mean /
   variance / lag-1 correlation events from a seeded RNG, hashes the answer key
   so a run is a replayable receipt, and scores each read's alarm rising edges
   for hits, misses, false alarms and lag. Run `python3 co_harness.py` (no
   args) for the self-test — it must print `ALL PASS` — after any change to the
-  signal model, the event schedule or the scoring. Its constants mirror
-  `src/HunterMode.jsx` (`BUFFER_LIMIT`, `BASELINE`, `THRESHOLD`, noise range);
-  if you change those in the tool, change them here too. Reads plug in as a
+  signal model, the event schedule or the scoring. Its constants no longer
+  track `src/HunterMode.jsx`; don't change them to follow the tool. Reads plug in as a
   Python class (`--read file.py:Class`) or any executable speaking its JSON-lines
   contract (`--external`), which must flush stdout after every line. Keep runs
   seed-deterministic: the same seed must reproduce the same answer-key hash.

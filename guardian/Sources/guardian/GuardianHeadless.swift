@@ -22,14 +22,23 @@ func detectLaunchMode() -> Bool {
 func runHeadlessDaemon() {
 
     let useOpacity = CommandLine.arguments.contains("--opacity")
-    let port: UInt16 = {
-        if let idx = CommandLine.arguments.firstIndex(of: "--port"),
-           idx + 1 < CommandLine.arguments.count,
-           let p = UInt16(CommandLine.arguments[idx + 1]) {
-            return p
-        }
-        return 8547
-    }()
+
+    // Value of `--name <value>`, if given.
+    func flag(_ name: String) -> String? {
+        guard let idx = CommandLine.arguments.firstIndex(of: name),
+              idx + 1 < CommandLine.arguments.count else { return nil }
+        return CommandLine.arguments[idx + 1]
+    }
+
+    let port: UInt16 = flag("--port").flatMap { UInt16($0) } ?? 8547
+
+    // Hunter Mode's real channels. Defaults: en0 and Guardian's ~/vault.
+    var signalConfig = SignalConfig()
+    if let iface = flag("--iface") { signalConfig.interface = iface }
+    if let vault = flag("--vault") {
+        signalConfig.vaultDir = URL(fileURLWithPath: (vault as NSString).expandingTildeInPath)
+    }
+    if let predicate = flag("--auth-predicate") { signalConfig.authPredicate = predicate }
 
     print("""
     ┌─────────────────────────────────────────────────────┐
@@ -53,11 +62,17 @@ func runHeadlessDaemon() {
         print("[Guardian] Calibrated monitoring active (no opacity).")
     }
 
+    // Sample failed auths, outbound connections and vault hash drift for /signals.
+    let probe = SignalProbe(config: signalConfig)
+    probe.start()
+    print("[Guardian] Signals: failed auths, outbound on \(signalConfig.interface), vault hash drift.")
+
     // Bring up the status endpoint so `curl localhost:<port>/status` works.
-    let server = StatusServer(port: port, engine: engine)
+    let server = StatusServer(port: port, engine: engine, probe: probe)
     server.start()
 
     print("[Guardian] Status endpoint: http://localhost:\(port)/status")
+    print("[Guardian] Signals endpoint: http://localhost:\(port)/signals")
     print("[Guardian] Entering perpetual expansion loop...")
 
     // Block forever — LaunchAgent keepalive requires the process to stay alive.

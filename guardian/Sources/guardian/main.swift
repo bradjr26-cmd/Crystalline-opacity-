@@ -12,6 +12,9 @@ import Foundation
 //   --headless   run as daemon (required for LaunchAgent)
 //   --opacity    enable crystalline-soma pipeline (φ-basis)
 //   --port N     status HTTP port (default 8547)
+//   --iface IF   interface whose outbound connections /signals counts (default en0)
+//   --vault DIR  evidence vault whose ledger /signals re-hashes (default ~/vault)
+//   --auth-predicate P   unified-log predicate for failed auths (see SignalProbe)
 // ============================================================
 
 rotateLogsIfNeeded()
@@ -22,12 +25,15 @@ if detectLaunchMode() {
     // No UI in this build. Print usage and exit cleanly.
     print("""
     Guardian (headless build)
-    Usage: guardian --headless [--opacity] [--port <n>]
+    Usage: guardian --headless [--opacity] [--port <n>] [--iface <if>] [--vault <dir>]
 
       --headless   Run as a perpetual daemon (LaunchAgent keepalive).
       --opacity    Enable crystalline-soma monitoring (φ-basis).
                    Omit for calibrated-only monitoring.
       --port <n>   Status endpoint port (default 8547).
+      --iface <if> Interface for the outbound-connections signal (default en0).
+      --vault <dir> Evidence vault for the hash-drift signal (default ~/vault).
+      --auth-predicate <p>  Unified-log predicate for the failed-auths signal.
 
     Example:
       guardian --headless --opacity --port 8547
