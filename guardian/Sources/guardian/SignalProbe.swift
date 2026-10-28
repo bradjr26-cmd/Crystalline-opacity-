@@ -29,12 +29,33 @@ import Darwin
 // the interface has no address, no integrity.log) reports value null with a
 // note, never 0. A dead sensor that reads "all clear" is how the original
 // Hunter Mode lied.
+//
+// THE PHONE PATH: the Mac mini is airgapped, so nothing reaches /signals from
+// outside it. The probe also judges every sample itself — the same baseline
+// rule Hunter Mode uses — and writes a small snapshot, hunter_signals.json,
+// into the iCloud Drive folder guardian_opacity/ (one writer: this daemon;
+// the phone's signals.jsonl is never touched). The iPhone widget
+// (guardian/phone/hunter_widget.js) reads it. The snapshot carries the last
+// 24 h of crossings, because a widget refreshes every few minutes and must not
+// miss a 10-second burst between refreshes.
 // ============================================================
 
 struct SignalConfig {
     var interface = "en0"
     var vaultDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("vault")
     var authPredicate = SignalProbe.defaultAuthPredicate
+    // Where the phone's snapshot goes; nil = don't write one.
+    var snapshotDir: URL? = SignalConfig.defaultSnapshotDir()
+
+    // iCloud Drive's root on macOS, plus the folder the rest of the stack uses.
+    // Only if iCloud Drive is actually there: writing into a folder that doesn't
+    // sync would look like it works while the phone never sees a thing.
+    static func defaultSnapshotDir() -> URL? {
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs")
+        guard FileManager.default.fileExists(atPath: root.path) else { return nil }
+        return root.appendingPathComponent("guardian_opacity")
+    }
 }
 
 final class SignalProbe {
@@ -42,6 +63,23 @@ final class SignalProbe {
     static let sampleSeconds = 5
     static let hashSeconds = 60
     static let historyLength = 24 * 3600 / sampleSeconds      // 24 h of samples
+
+    // The baseline rule. These MUST match src/HunterMode.jsx (K_SPREAD, MIN_STEP,
+    // CALIBRATION_MIN) so the phone and the console judge a sample the same way:
+    //   threshold = median + max(kSpread × 1.4826 × MAD, minStep)
+    // over the channel's history; calibrating until calibrationMin readings.
+    // hash_drift has no learned baseline: the vault ledger is its baseline,
+    // so any drift (≥ 1 file) is an anomaly.
+    static let kSpread = 4.0
+    static let minStep = 1.0
+    static let calibrationMin = 60
+
+    // The phone's snapshot.
+    static let snapshotName = "hunter_signals.json"
+    static let snapshotSeconds = 60                            // and at once on a new event
+    static let eventWindowSeconds = 24 * 3600
+    static let eventCap = 200
+    static let sparkSamples = 60                               // last 5 min per channel
 
     // Failed logins on the paths a headless Mac Mini exposes: SSH (sshd, or
     // sshd-session on OpenSSH 9.8+), sudo, and Screen Sharing. It matches each
@@ -61,6 +99,13 @@ final class SignalProbe {
     private struct Reading {
         var value: Int?          // nil = no reading (the source is down)
         var note: String
+    }
+
+    struct Baseline {
+        let center: Double
+        let threshold: Double
+        let n: Int               // readings it was measured on
+        let calibrating: Bool
     }
 
     private let config: SignalConfig
@@ -89,6 +134,14 @@ final class SignalProbe {
     private var historyAuth: [Int?] = []
     private var historyNet: [Int?] = []
     private var historyDrift: [Int?] = []
+
+    // judgement of the latest sample, and crossings over the last 24 h
+    private var lastStatus: [String: String] = [:]
+    private var lastBaseline: [String: Baseline] = [:]
+    private var events: [[String: Any]] = []
+    private var lastSnapshotAt = 0
+    private var snapshotOK: Bool? = nil                        // nil = not written yet
+    private var snapshotNote = ""
 
     init(config: SignalConfig) {
         self.config = config
@@ -120,7 +173,7 @@ final class SignalProbe {
     private func sample() {
         let netReading = sampleOutbound()            // runs netstat; keep it outside the lock
 
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         auth = authUp ? Reading(value: authPending, note: "") : Reading(value: nil, note: authNote)
         authPending = 0
         net = netReading
@@ -137,6 +190,129 @@ final class SignalProbe {
             historyNet.removeFirst(extra)
             historyDrift.removeFirst(extra)
         }
+
+        let fresh = judge()
+        var snapshot: Data? = nil
+        if config.snapshotDir != nil,
+           fresh || sampledAt - lastSnapshotAt >= SignalProbe.snapshotSeconds {
+            snapshot = snapshotData()
+            lastSnapshotAt = sampledAt
+        }
+        lock.unlock()
+
+        if let data = snapshot { writeSnapshot(data) }   // file I/O outside the lock
+    }
+
+    // MARK: - Judgement (the same rule as Hunter Mode)
+
+    static func median(_ sorted: [Double]) -> Double {
+        let n = sorted.count, m = n / 2
+        return n % 2 == 1 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2
+    }
+
+    static func baseline(_ history: [Int?], ledger: Bool) -> Baseline {
+        if ledger { return Baseline(center: 0, threshold: 1, n: history.count, calibrating: false) }
+        let xs = history.compactMap { $0 }.map(Double.init).sorted()
+        guard xs.count >= calibrationMin else {
+            return Baseline(center: 0, threshold: 0, n: xs.count, calibrating: true)
+        }
+        let center = median(xs)
+        let mad = median(xs.map { abs($0 - center) }.sorted())
+        return Baseline(center: center, threshold: center + max(kSpread * 1.4826 * mad, minStep),
+                        n: xs.count, calibrating: false)
+    }
+
+    static func status(_ value: Int?, _ b: Baseline) -> String {
+        guard let v = value else { return "no-signal" }
+        if b.calibrating { return "calibrating" }
+        return Double(v) >= b.threshold ? "anomaly" : "clear"
+    }
+
+    // Judge the sample just taken; log a crossing (→ anomaly) or a lost source
+    // (→ no-signal) as an event. Returns true when something new was logged.
+    // Call with the lock held.
+    private func judge() -> Bool {
+        var fresh = false
+        let table: [(key: String, value: Int?, note: String, history: [Int?], ledger: Bool)] = [
+            ("failed_auths", auth.value, auth.note, historyAuth, false),
+            ("outbound", net.value, net.note, historyNet, false),
+            ("hash_drift", drift.value, drift.note, historyDrift, true),
+        ]
+        for ch in table {
+            let b = SignalProbe.baseline(ch.history, ledger: ch.ledger)
+            let st = SignalProbe.status(ch.value, b)
+            let was = lastStatus[ch.key]
+            if st == "anomaly", was != "anomaly", let v = ch.value {
+                events.append(["t": sampledAt, "channel": ch.key, "kind": "anomaly",
+                               "value": v, "threshold": b.threshold])
+                fresh = true
+            } else if st == "no-signal", let w = was, w != "no-signal" {
+                events.append(["t": sampledAt, "channel": ch.key, "kind": "no-signal", "note": ch.note])
+                fresh = true
+            }
+            lastStatus[ch.key] = st
+            lastBaseline[ch.key] = b
+        }
+        let cutoff = sampledAt - SignalProbe.eventWindowSeconds
+        events.removeAll { ($0["t"] as? Int ?? 0) < cutoff }
+        if events.count > SignalProbe.eventCap { events.removeFirst(events.count - SignalProbe.eventCap) }
+        return fresh
+    }
+
+    // MARK: - The phone's snapshot (iCloud Drive)
+
+    // Call with the lock held.
+    private func snapshotData() -> Data? {
+        func channel(_ key: String, _ r: Reading, _ history: [Int?], extra: [String: Any]) -> [String: Any] {
+            var d: [String: Any] = [
+                "value": r.value.map { $0 as Any } ?? NSNull(),
+                "ok": r.value != nil,
+                "status": lastStatus[key] ?? "no-signal",
+                "spark": history.suffix(SignalProbe.sparkSamples).map { $0.map { $0 as Any } ?? NSNull() },
+            ]
+            if let b = lastBaseline[key] {
+                d["n"] = b.n
+                if !b.calibrating { d["center"] = b.center; d["threshold"] = b.threshold }
+            }
+            if !r.note.isEmpty { d["note"] = r.note }
+            for (k, v) in extra { d[k] = v }
+            return d
+        }
+        let body: [String: Any] = [
+            "service": "guardian",
+            "version": 1,
+            "written_at": Int(Date().timeIntervalSince1970),
+            "sampled_at": sampledAt,
+            "interval_s": SignalProbe.sampleSeconds,
+            "calibration_min": SignalProbe.calibrationMin,
+            "channels": [
+                "failed_auths": channel("failed_auths", auth, historyAuth, extra: ["window_s": SignalProbe.sampleSeconds]),
+                "outbound": channel("outbound", net, historyNet, extra: ["interface": config.interface]),
+                "hash_drift": channel("hash_drift", drift, historyDrift, extra: ["baseline": "ledger"]),
+            ],
+            "events": events,
+        ]
+        return try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+    }
+
+    private func writeSnapshot(_ data: Data) {
+        guard let dir = config.snapshotDir else { return }
+        var ok = true, note = ""
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try data.write(to: dir.appendingPathComponent(SignalProbe.snapshotName), options: .atomic)
+        } catch {
+            // Usually macOS privacy: a LaunchAgent binary needs Full Disk Access
+            // (or Files and Folders → iCloud Drive) to write into iCloud Drive.
+            ok = false
+            note = "could not write the iCloud snapshot - give the guardian binary Full Disk Access"
+        }
+        lock.lock()
+        let changed = snapshotOK != ok
+        snapshotOK = ok
+        snapshotNote = note
+        lock.unlock()
+        if changed { print(ok ? "[SignalProbe] iCloud snapshot written." : "[SignalProbe] \(note)") }
     }
 
     // MARK: - failed_auths (log stream)
@@ -335,10 +511,15 @@ final class SignalProbe {
             return d
         }
 
+        var snapshot: [String: Any] = ["enabled": config.snapshotDir != nil,
+                                       "ok": snapshotOK.map { $0 as Any } ?? NSNull(),
+                                       "last_written": lastSnapshotAt]
+        if !snapshotNote.isEmpty { snapshot["note"] = snapshotNote }
         var body: [String: Any] = [
             "service": "guardian",
             "interval_s": SignalProbe.sampleSeconds,
             "sampled_at": sampledAt,
+            "snapshot": snapshot,
             "channels": [
                 "failed_auths": channel(auth, source: "log stream",
                                         extra: ["window_s": SignalProbe.sampleSeconds]),

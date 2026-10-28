@@ -15,7 +15,15 @@ import Foundation
 //   --iface IF   interface whose outbound connections /signals counts (default en0)
 //   --vault DIR  evidence vault whose ledger /signals re-hashes (default ~/vault)
 //   --auth-predicate P   unified-log predicate for failed auths (see SignalProbe)
+//   --icloud-dir DIR     where the phone's hunter_signals.json goes
+//                        (default iCloud Drive/guardian_opacity)
+//   --no-icloud          don't write the phone's snapshot
 // ============================================================
+
+// The LaunchAgent sends stdout to /tmp/guardian.log. A file is block-buffered by
+// default, so lines would sit unwritten (and be lost when launchd restarts the
+// process). Line-buffer it so every message lands as it's printed.
+setvbuf(stdout, nil, _IOLBF, 0)
 
 rotateLogsIfNeeded()
 
@@ -34,6 +42,8 @@ if detectLaunchMode() {
       --iface <if> Interface for the outbound-connections signal (default en0).
       --vault <dir> Evidence vault for the hash-drift signal (default ~/vault).
       --auth-predicate <p>  Unified-log predicate for the failed-auths signal.
+      --icloud-dir <dir>    Folder for the phone's snapshot (default iCloud Drive/guardian_opacity).
+      --no-icloud           Don't write the phone's snapshot.
 
     Example:
       guardian --headless --opacity --port 8547

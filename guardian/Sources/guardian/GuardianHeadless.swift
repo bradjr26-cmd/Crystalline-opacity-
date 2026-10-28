@@ -39,6 +39,10 @@ func runHeadlessDaemon() {
         signalConfig.vaultDir = URL(fileURLWithPath: (vault as NSString).expandingTildeInPath)
     }
     if let predicate = flag("--auth-predicate") { signalConfig.authPredicate = predicate }
+    if let dir = flag("--icloud-dir") {
+        signalConfig.snapshotDir = URL(fileURLWithPath: (dir as NSString).expandingTildeInPath)
+    }
+    if CommandLine.arguments.contains("--no-icloud") { signalConfig.snapshotDir = nil }
 
     print("""
     ┌─────────────────────────────────────────────────────┐
@@ -66,6 +70,9 @@ func runHeadlessDaemon() {
     let probe = SignalProbe(config: signalConfig)
     probe.start()
     print("[Guardian] Signals: failed auths, outbound on \(signalConfig.interface), vault hash drift.")
+    print(signalConfig.snapshotDir == nil
+          ? "[Guardian] Phone snapshot: off (no iCloud Drive found; pass --icloud-dir to set one)."
+          : "[Guardian] Phone snapshot: \(SignalProbe.snapshotName) in iCloud Drive/guardian_opacity.")
 
     // Bring up the status endpoint so `curl localhost:<port>/status` works.
     let server = StatusServer(port: port, engine: engine, probe: probe)

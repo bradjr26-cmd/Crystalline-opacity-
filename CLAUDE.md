@@ -28,6 +28,7 @@ src/
   GroundwaterLevels.jsx  Tool: USGS NWIS Ohio groundwater-level viewer
   CrystalComposer.jsx    Tool: "Crystal Composer" — local ballast/Helios/Guardian agent composer
   HunterMode.jsx         Tool: "Hunter Mode" — sweep-radar watch over the Guardian daemon's real signals + Sol (Claude)
+guardian/             Guardian daemon (SwiftPM, macOS): /status, /signals, the phone's iCloud snapshot; phone/hunter_widget.js is its Scriptable widget
 portability_layer.py  Standalone Python skeleton — "canon meeting" form-checker
 tidal_lines.py        Standalone Python script — tidal-signal discriminator (has a synthetic self-test)
 co_harness.py         Standalone Python script — scores detector "reads" against a planted answer key (has a self-test)
@@ -179,6 +180,14 @@ open bumps its hit count (`×n` in the log). The log is capped at
 disappears. Below `STACK_BELOW` px the three panels stack vertically. State
 updaters stay pure (`mergeHistory` copies, never mutates) because StrictMode
 runs them twice.
+
+The Mac mini is airgapped, so the same judgement also runs in the daemon:
+`SignalProbe.swift` applies the identical rule and writes `hunter_signals.json`
+into iCloud Drive/`guardian_opacity/` for the iPhone widget
+(`guardian/phone/hunter_widget.js`). **`K_SPREAD`, `MIN_STEP` and
+`CALIBRATION_MIN` live in both `src/HunterMode.jsx` and `SignalProbe.swift`
+(`kSpread`, `minStep`, `calibrationMin`); change them together** or the phone
+and the console will disagree about what an anomaly is.
 
 **Sol** is the prompt bar under the top bar: the operator speaks, and Sol
 (Claude) answers from the Guardian daemon's `GET /status` plus a snapshot of
